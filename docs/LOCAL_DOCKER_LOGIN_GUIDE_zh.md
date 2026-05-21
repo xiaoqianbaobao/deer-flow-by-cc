@@ -159,6 +159,9 @@ docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 - Password 输入框
 - `Sign in` 按钮
 
+<img width="1899" height="950" alt="image" src="https://github.com/user-attachments/assets/fbc8d29e-6367-464d-bc27-6faa7cd3d325" />
+
+
 而不是：
 
 - `Could not reach the auth service.`
