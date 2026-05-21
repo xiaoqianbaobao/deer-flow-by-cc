@@ -13,14 +13,16 @@ matching the LangGraph Platform wire format expected by the
 from __future__ import annotations
 
 import logging
-import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.gateway.deps import get_checkpointer, get_store
+from app.gateway.identity.request_scope import extract_scope
+from app.gateway.identity.settings import get_identity_settings
 from deerflow.config.paths import Paths, get_paths
 from deerflow.runtime import serialize_channel_values
 
@@ -33,6 +35,25 @@ THREADS_NS: tuple[str, ...] = ("threads",)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/threads", tags=["threads"])
+
+
+def _to_iso_timestamp(value: Any) -> str:
+    """Coerce a stored timestamp into an ISO 8601 string.
+
+    Historical store records (pre 2026-04-27) wrote `time.time()` floats; new
+    records write ISO strings. This helper accepts both shapes plus the empty
+    fallback so the wire format the frontend sees is always parseable by
+    `new Date(...)`.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=UTC).isoformat()
+    text = str(value)
+    try:
+        return datetime.fromtimestamp(float(text), tz=UTC).isoformat()
+    except (ValueError, TypeError):
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +147,26 @@ class ThreadHistoryRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _delete_thread_data(thread_id: str, paths: Paths | None = None) -> ThreadDeleteResponse:
-    """Delete local persisted filesystem data for a thread."""
+def _delete_thread_data(
+    thread_id: str,
+    *,
+    tenant_id: int | None = None,
+    workspace_id: int | None = None,
+    paths: Paths | None = None,
+) -> ThreadDeleteResponse:
+    """Delete local persisted filesystem data for a thread.
+
+    When ``tenant_id`` and ``workspace_id`` are both supplied (M4 storage
+    isolation), the tenant-stratified directory is removed; otherwise the
+    legacy single-tenant layout is used. Anonymous / identity-off callers
+    pass ``None`` for both — same fallback semantics as ``uploads.py`` and
+    ``artifacts.py``.
+    """
     path_manager = paths or get_paths()
     try:
-        path_manager.delete_thread_dir(thread_id)
+        path_manager.delete_thread_dir_for(
+            thread_id, tenant_id=tenant_id, workspace_id=workspace_id
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except FileNotFoundError:
@@ -145,18 +181,29 @@ def _delete_thread_data(thread_id: str, paths: Paths | None = None) -> ThreadDel
     return ThreadDeleteResponse(success=True, message=f"Deleted local thread data for {thread_id}")
 
 
-async def _store_get(store, thread_id: str) -> dict | None:
+async def _store_get(
+    store, thread_id: str, namespace: tuple[str, ...] = THREADS_NS
+) -> dict | None:
     """Fetch a thread record from the Store; returns ``None`` if absent."""
-    item = await store.aget(THREADS_NS, thread_id)
+    item = await store.aget(namespace, thread_id)
     return item.value if item is not None else None
 
 
-async def _store_put(store, record: dict) -> None:
+async def _store_put(
+    store, record: dict, namespace: tuple[str, ...] = THREADS_NS
+) -> None:
     """Write a thread record to the Store."""
-    await store.aput(THREADS_NS, record["thread_id"], record)
+    await store.aput(namespace, record["thread_id"], record)
 
 
-async def _store_upsert(store, thread_id: str, *, metadata: dict | None = None, values: dict | None = None) -> None:
+async def _store_upsert(
+    store,
+    thread_id: str,
+    *,
+    metadata: dict | None = None,
+    values: dict | None = None,
+    namespace: tuple[str, ...] = THREADS_NS,
+) -> None:
     """Create or refresh a thread record in the Store.
 
     On creation the record is written with ``status="idle"``.  On update only
@@ -166,8 +213,8 @@ async def _store_upsert(store, thread_id: str, *, metadata: dict | None = None, 
     ``values`` carries the agent-state snapshot exposed to the frontend
     (currently just ``{"title": "..."}``).
     """
-    now = time.time()
-    existing = await _store_get(store, thread_id)
+    now = datetime.now(UTC).isoformat()
+    existing = await _store_get(store, thread_id, namespace=namespace)
     if existing is None:
         await _store_put(
             store,
@@ -179,6 +226,7 @@ async def _store_upsert(store, thread_id: str, *, metadata: dict | None = None, 
                 "metadata": metadata or {},
                 "values": values or {},
             },
+            namespace=namespace,
         )
     else:
         val = dict(existing)
@@ -187,7 +235,59 @@ async def _store_upsert(store, thread_id: str, *, metadata: dict | None = None, 
             val.setdefault("metadata", {}).update(metadata)
         if values:
             val.setdefault("values", {}).update(values)
-        await _store_put(store, val)
+        await _store_put(store, val, namespace=namespace)
+
+
+def _thread_scope_namespace(request: Request) -> tuple[str, ...]:
+    """Return store namespace for current caller.
+
+    With identity enabled + authenticated user context, threads are scoped to:
+    ``("threads", "tenant:{tid}", "workspace:{wid}", "user:{uid}")``.
+    This prevents cross-user thread listing within the same tenant/workspace.
+    """
+    if not get_identity_settings().enabled:
+        return THREADS_NS
+
+    identity = getattr(request.state, "identity", None)
+    if identity is None or getattr(identity, "is_authenticated", False) is False:
+        return THREADS_NS
+
+    tenant_id, workspace_id = extract_scope(request)
+    user_id = getattr(identity, "user_id", None)
+    if (
+        isinstance(user_id, int)
+        and user_id > 0
+        and tenant_id is not None
+        and workspace_id is not None
+    ):
+        return (
+            "threads",
+            f"tenant:{tenant_id}",
+            f"workspace:{workspace_id}",
+            f"user:{user_id}",
+        )
+    return THREADS_NS
+
+
+def _is_scoped_thread_namespace(namespace: tuple[str, ...]) -> bool:
+    """Returns True when thread store namespace is identity-scoped."""
+    return len(namespace) > 1
+
+
+async def _ensure_scoped_thread_access(
+    *,
+    store,
+    thread_id: str,
+    namespace: tuple[str, ...],
+) -> None:
+    """Require thread ownership lookup when identity-scoped namespace is active."""
+    if not _is_scoped_thread_namespace(namespace):
+        return
+    if store is None:
+        raise HTTPException(status_code=503, detail="Store not available")
+    record = await _store_get(store, thread_id, namespace=namespace)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
 
 
 def _derive_thread_status(checkpoint_tuple) -> str:
@@ -219,16 +319,29 @@ async def delete_thread_data(thread_id: str, request: Request) -> ThreadDeleteRe
     """Delete local persisted filesystem data for a thread.
 
     Cleans DeerFlow-managed thread directories, removes checkpoint data,
-    and removes the thread record from the Store.
+    and removes the thread record from the Store. Reads tenant identity from
+    ``request.state.identity`` (populated by ``IdentityMiddleware`` when the
+    feature flag is on) so identity-on threads physically remove the
+    tenant-stratified directory rather than no-op'ing on the legacy path.
     """
-    # Clean local filesystem
-    response = _delete_thread_data(thread_id)
+    tenant_id, workspace_id = extract_scope(request)
+    threads_ns = _thread_scope_namespace(request)
 
-    # Remove from Store (best-effort)
+    # Authorize before any destructive action: in scoped mode, reject foreign
+    # thread_ids before touching the local filesystem so a 404 cannot be used
+    # to cause cross-user fs deletion within the same tenant/workspace.
     store = get_store(request)
+    await _ensure_scoped_thread_access(
+        store=store, thread_id=thread_id, namespace=threads_ns
+    )
+
+    # Clean local filesystem
+    response = _delete_thread_data(
+        thread_id, tenant_id=tenant_id, workspace_id=workspace_id
+    )
     if store is not None:
         try:
-            await store.adelete(THREADS_NS, thread_id)
+            await store.adelete(threads_ns, thread_id)
         except Exception:
             logger.debug("Could not delete store record for thread %s (not critical)", thread_id)
 
@@ -254,18 +367,19 @@ async def create_thread(body: ThreadCreateRequest, request: Request) -> ThreadRe
     """
     store = get_store(request)
     checkpointer = get_checkpointer(request)
+    threads_ns = _thread_scope_namespace(request)
     thread_id = body.thread_id or str(uuid.uuid4())
-    now = time.time()
+    now = datetime.now(UTC).isoformat()
 
     # Idempotency: return existing record from Store when already present
     if store is not None:
-        existing_record = await _store_get(store, thread_id)
+        existing_record = await _store_get(store, thread_id, namespace=threads_ns)
         if existing_record is not None:
             return ThreadResponse(
                 thread_id=thread_id,
                 status=existing_record.get("status", "idle"),
-                created_at=str(existing_record.get("created_at", "")),
-                updated_at=str(existing_record.get("updated_at", "")),
+                created_at=_to_iso_timestamp(existing_record.get("created_at")),
+                updated_at=_to_iso_timestamp(existing_record.get("updated_at")),
                 metadata=existing_record.get("metadata", {}),
             )
 
@@ -281,6 +395,7 @@ async def create_thread(body: ThreadCreateRequest, request: Request) -> ThreadRe
                     "updated_at": now,
                     "metadata": body.metadata,
                 },
+                namespace=threads_ns,
             )
         except Exception:
             logger.exception("Failed to write thread %s to store", thread_id)
@@ -308,8 +423,8 @@ async def create_thread(body: ThreadCreateRequest, request: Request) -> ThreadRe
     return ThreadResponse(
         thread_id=thread_id,
         status="idle",
-        created_at=str(now),
-        updated_at=str(now),
+        created_at=now,
+        updated_at=now,
         metadata=body.metadata,
     )
 
@@ -333,6 +448,7 @@ async def search_threads(body: ThreadSearchRequest, request: Request) -> list[Th
     """
     store = get_store(request)
     checkpointer = get_checkpointer(request)
+    threads_ns = _thread_scope_namespace(request)
 
     # -----------------------------------------------------------------------
     # Phase 1: Store
@@ -341,7 +457,7 @@ async def search_threads(body: ThreadSearchRequest, request: Request) -> list[Th
 
     if store is not None:
         try:
-            items = await store.asearch(THREADS_NS, limit=10_000)
+            items = await store.asearch(threads_ns, limit=10_000)
         except Exception:
             logger.warning("Store search failed — falling back to checkpointer only", exc_info=True)
             items = []
@@ -351,8 +467,8 @@ async def search_threads(body: ThreadSearchRequest, request: Request) -> list[Th
             merged[val["thread_id"]] = ThreadResponse(
                 thread_id=val["thread_id"],
                 status=val.get("status", "idle"),
-                created_at=str(val.get("created_at", "")),
-                updated_at=str(val.get("updated_at", "")),
+                created_at=_to_iso_timestamp(val.get("created_at")),
+                updated_at=_to_iso_timestamp(val.get("updated_at")),
                 metadata=val.get("metadata", {}),
                 values=val.get("values", {}),
             )
@@ -362,44 +478,52 @@ async def search_threads(body: ThreadSearchRequest, request: Request) -> list[Th
     # Discovers threads not yet in the Store (e.g. created by LangGraph
     # Server) and lazily migrates them so future searches skip this phase.
     # -----------------------------------------------------------------------
+    should_scan_checkpointer = not _is_scoped_thread_namespace(threads_ns)
     try:
-        async for checkpoint_tuple in checkpointer.alist(None):
-            cfg = getattr(checkpoint_tuple, "config", {})
-            thread_id = cfg.get("configurable", {}).get("thread_id")
-            if not thread_id or thread_id in merged:
-                continue
+        if should_scan_checkpointer:
+            async for checkpoint_tuple in checkpointer.alist(None):
+                cfg = getattr(checkpoint_tuple, "config", {})
+                thread_id = cfg.get("configurable", {}).get("thread_id")
+                if not thread_id or thread_id in merged:
+                    continue
 
-            # Skip sub-graph checkpoints (checkpoint_ns is non-empty for those)
-            if cfg.get("configurable", {}).get("checkpoint_ns", ""):
-                continue
+                # Skip sub-graph checkpoints (checkpoint_ns is non-empty for those)
+                if cfg.get("configurable", {}).get("checkpoint_ns", ""):
+                    continue
 
-            ckpt_meta = getattr(checkpoint_tuple, "metadata", {}) or {}
-            # Strip LangGraph internal keys from the user-visible metadata dict
-            user_meta = {k: v for k, v in ckpt_meta.items() if k not in ("created_at", "updated_at", "step", "source", "writes", "parents")}
+                ckpt_meta = getattr(checkpoint_tuple, "metadata", {}) or {}
+                # Strip LangGraph internal keys from the user-visible metadata dict
+                user_meta = {k: v for k, v in ckpt_meta.items() if k not in ("created_at", "updated_at", "step", "source", "writes", "parents")}
 
-            # Extract state values (title) from the checkpoint's channel_values
-            checkpoint_data = getattr(checkpoint_tuple, "checkpoint", {}) or {}
-            channel_values = checkpoint_data.get("channel_values", {})
-            ckpt_values = {}
-            if title := channel_values.get("title"):
-                ckpt_values["title"] = title
+                # Extract state values (title) from the checkpoint's channel_values
+                checkpoint_data = getattr(checkpoint_tuple, "checkpoint", {}) or {}
+                channel_values = checkpoint_data.get("channel_values", {})
+                ckpt_values = {}
+                if title := channel_values.get("title"):
+                    ckpt_values["title"] = title
 
-            thread_resp = ThreadResponse(
-                thread_id=thread_id,
-                status=_derive_thread_status(checkpoint_tuple),
-                created_at=str(ckpt_meta.get("created_at", "")),
-                updated_at=str(ckpt_meta.get("updated_at", ckpt_meta.get("created_at", ""))),
-                metadata=user_meta,
-                values=ckpt_values,
-            )
-            merged[thread_id] = thread_resp
+                thread_resp = ThreadResponse(
+                    thread_id=thread_id,
+                    status=_derive_thread_status(checkpoint_tuple),
+                    created_at=_to_iso_timestamp(ckpt_meta.get("created_at")),
+                    updated_at=_to_iso_timestamp(ckpt_meta.get("updated_at") or ckpt_meta.get("created_at")),
+                    metadata=user_meta,
+                    values=ckpt_values,
+                )
+                merged[thread_id] = thread_resp
 
-            # Lazy migration — write to Store so the next search finds it there
-            if store is not None:
-                try:
-                    await _store_upsert(store, thread_id, metadata=user_meta, values=ckpt_values or None)
-                except Exception:
-                    logger.debug("Failed to migrate thread %s to store (non-fatal)", thread_id)
+                # Lazy migration — write to Store so the next search finds it there
+                if store is not None:
+                    try:
+                        await _store_upsert(
+                            store,
+                            thread_id,
+                            metadata=user_meta,
+                            values=ckpt_values or None,
+                            namespace=threads_ns,
+                        )
+                    except Exception:
+                        logger.debug("Failed to migrate thread %s to store (non-fatal)", thread_id)
     except Exception:
         logger.exception("Checkpointer scan failed during thread search")
         # Don't raise — return whatever was collected from Store + partial scan
@@ -423,20 +547,21 @@ async def search_threads(body: ThreadSearchRequest, request: Request) -> list[Th
 async def patch_thread(thread_id: str, body: ThreadPatchRequest, request: Request) -> ThreadResponse:
     """Merge metadata into a thread record."""
     store = get_store(request)
+    threads_ns = _thread_scope_namespace(request)
     if store is None:
         raise HTTPException(status_code=503, detail="Store not available")
 
-    record = await _store_get(store, thread_id)
+    record = await _store_get(store, thread_id, namespace=threads_ns)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
 
-    now = time.time()
+    now = datetime.now(UTC).isoformat()
     updated = dict(record)
     updated.setdefault("metadata", {}).update(body.metadata)
     updated["updated_at"] = now
 
     try:
-        await _store_put(store, updated)
+        await _store_put(store, updated, namespace=threads_ns)
     except Exception:
         logger.exception("Failed to patch thread %s", thread_id)
         raise HTTPException(status_code=500, detail="Failed to update thread")
@@ -444,8 +569,8 @@ async def patch_thread(thread_id: str, body: ThreadPatchRequest, request: Reques
     return ThreadResponse(
         thread_id=thread_id,
         status=updated.get("status", "idle"),
-        created_at=str(updated.get("created_at", "")),
-        updated_at=str(now),
+        created_at=_to_iso_timestamp(updated.get("created_at")),
+        updated_at=now,
         metadata=updated.get("metadata", {}),
     )
 
@@ -460,10 +585,11 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
     """
     store = get_store(request)
     checkpointer = get_checkpointer(request)
+    threads_ns = _thread_scope_namespace(request)
 
     record: dict | None = None
     if store is not None:
-        record = await _store_get(store, thread_id)
+        record = await _store_get(store, thread_id, namespace=threads_ns)
 
     # Derive accurate status from the checkpointer
     config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
@@ -478,7 +604,11 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
 
     # If the thread exists in the checkpointer but not the store (e.g. legacy
     # data), synthesize a minimal store record from the checkpoint metadata.
-    if record is None and checkpoint_tuple is not None:
+    if (
+        record is None
+        and checkpoint_tuple is not None
+        and not _is_scoped_thread_namespace(threads_ns)
+    ):
         ckpt_meta = getattr(checkpoint_tuple, "metadata", {}) or {}
         record = {
             "thread_id": thread_id,
@@ -498,8 +628,8 @@ async def get_thread(thread_id: str, request: Request) -> ThreadResponse:
     return ThreadResponse(
         thread_id=thread_id,
         status=status,
-        created_at=str(record.get("created_at", "")),
-        updated_at=str(record.get("updated_at", "")),
+        created_at=_to_iso_timestamp(record.get("created_at")),
+        updated_at=_to_iso_timestamp(record.get("updated_at")),
         metadata=record.get("metadata", {}),
         values=serialize_channel_values(channel_values),
     )
@@ -513,6 +643,11 @@ async def get_thread_state(thread_id: str, request: Request) -> ThreadStateRespo
     are converted to JSON-safe dicts.
     """
     checkpointer = get_checkpointer(request)
+    store = get_store(request)
+    threads_ns = _thread_scope_namespace(request)
+    await _ensure_scoped_thread_access(
+        store=store, thread_id=thread_id, namespace=threads_ns
+    )
 
     config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
     try:
@@ -549,7 +684,7 @@ async def get_thread_state(thread_id: str, request: Request) -> ThreadStateRespo
         checkpoint={"id": checkpoint_id, "ts": str(metadata.get("created_at", ""))},
         checkpoint_id=checkpoint_id,
         parent_checkpoint_id=parent_checkpoint_id,
-        created_at=str(metadata.get("created_at", "")),
+        created_at=_to_iso_timestamp(metadata.get("created_at")),
         tasks=tasks,
     )
 
@@ -564,6 +699,10 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
     """
     checkpointer = get_checkpointer(request)
     store = get_store(request)
+    threads_ns = _thread_scope_namespace(request)
+    await _ensure_scoped_thread_access(
+        store=store, thread_id=thread_id, namespace=threads_ns
+    )
 
     # checkpoint_ns must be present in the config for aput — default to ""
     # (the root graph namespace).  checkpoint_id is optional; omitting it
@@ -595,7 +734,7 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
         channel_values.update(body.values)
 
     checkpoint["channel_values"] = channel_values
-    metadata["updated_at"] = time.time()
+    metadata["updated_at"] = datetime.now(UTC).isoformat()
 
     if body.as_node:
         metadata["source"] = "update"
@@ -624,7 +763,12 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
     # Sync title changes to the Store so /threads/search reflects them immediately.
     if store is not None and body.values and "title" in body.values:
         try:
-            await _store_upsert(store, thread_id, values={"title": body.values["title"]})
+            await _store_upsert(
+                store,
+                thread_id,
+                values={"title": body.values["title"]},
+                namespace=threads_ns,
+            )
         except Exception:
             logger.debug("Failed to sync title to store for thread %s (non-fatal)", thread_id)
 
@@ -633,7 +777,7 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
         next=[],
         metadata=metadata,
         checkpoint_id=new_checkpoint_id,
-        created_at=str(metadata.get("created_at", "")),
+        created_at=_to_iso_timestamp(metadata.get("created_at")),
     )
 
 
@@ -641,6 +785,11 @@ async def update_thread_state(thread_id: str, body: ThreadStateUpdateRequest, re
 async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request: Request) -> list[HistoryEntry]:
     """Get checkpoint history for a thread."""
     checkpointer = get_checkpointer(request)
+    store = get_store(request)
+    threads_ns = _thread_scope_namespace(request)
+    await _ensure_scoped_thread_access(
+        store=store, thread_id=thread_id, namespace=threads_ns
+    )
 
     config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
     if body.before:
@@ -671,7 +820,7 @@ async def get_thread_history(thread_id: str, body: ThreadHistoryRequest, request
                     parent_checkpoint_id=parent_id,
                     metadata=metadata,
                     values=serialize_channel_values(channel_values),
-                    created_at=str(metadata.get("created_at", "")),
+                    created_at=_to_iso_timestamp(metadata.get("created_at")),
                     next=next_tasks,
                 )
             )

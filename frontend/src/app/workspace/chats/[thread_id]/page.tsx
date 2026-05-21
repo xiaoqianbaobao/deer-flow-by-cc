@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { type PromptInputMessage } from "@/components/ai-elements/prompt-input";
 import { ArtifactTrigger } from "@/components/workspace/artifacts";
@@ -17,6 +18,7 @@ import {
   MESSAGE_LIST_FOLLOWUPS_EXTRA_PADDING_BOTTOM,
 } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
+import { SkillBadgeBar } from "@/components/workspace/skill-badge-bar";
 import { ThreadTitle } from "@/components/workspace/thread-title";
 import { TodoList } from "@/components/workspace/todo-list";
 import { TokenUsageIndicator } from "@/components/workspace/token-usage-indicator";
@@ -25,6 +27,7 @@ import { useI18n } from "@/core/i18n/hooks";
 import { useModels } from "@/core/models/hooks";
 import { useNotification } from "@/core/notification/hooks";
 import { useThreadSettings } from "@/core/settings";
+import { useBindSkill, useBoundSkills } from "@/core/skills/hooks";
 import { useThreadStream } from "@/core/threads/hooks";
 import { textOfMessage } from "@/core/threads/utils";
 import { env } from "@/env";
@@ -39,6 +42,50 @@ export default function ChatPage() {
   const [mounted, setMounted] = useState(false);
   const { tokenUsageEnabled } = useModels();
   useSpecificChatMode();
+
+  const { boundSkills } = useBoundSkills(threadId);
+  const { mutate: bindSkill } = useBindSkill(threadId);
+  const searchParams = useSearchParams();
+
+  // Capture bind_skill / bind_version from initial URL once. The chat page
+  // replaces its URL via history.replaceState() after the first message which
+  // strips query params, so we must capture these on initial render.
+  const [pendingBind, setPendingBind] = useState<{
+    name: string;
+    version: string;
+  } | null>(() => {
+    const skill = searchParams.get("bind_skill");
+    return skill
+      ? { name: skill, version: searchParams.get("bind_version") ?? "latest" }
+      : null;
+  });
+
+  // Auto-bind once the thread is real (post-first-message). Once the bind
+  // mutation fires, drop the pendingBind so the badge falls back to the
+  // server-confirmed boundSkills list.
+  const didBindRef = useRef(false);
+  useEffect(() => {
+    if (didBindRef.current) return;
+    if (!pendingBind) return;
+    if (isNewThread || !threadId) return;
+    bindSkill(
+      { skillName: pendingBind.name, version: pendingBind.version },
+      { onSuccess: () => setPendingBind(null) },
+    );
+    didBindRef.current = true;
+  }, [isNewThread, threadId, bindSkill, pendingBind]);
+
+  // Optimistic badges shown before the server confirms the bind.
+  const optimisticBoundSkills =
+    pendingBind && boundSkills.length === 0
+      ? [
+          {
+            name: pendingBind.name,
+            version: pendingBind.version,
+            bound_at: "",
+          },
+        ]
+      : boundSkills;
 
   useEffect(() => {
     setMounted(true);
@@ -159,7 +206,22 @@ export default function ChatPage() {
                     }
                     context={settings.context}
                     extraHeader={
-                      isNewThread && <Welcome mode={settings.context.mode} />
+                      <div className="flex flex-col gap-3">
+                        {isNewThread && (
+                          <Welcome mode={settings.context.mode} />
+                        )}
+                        {optimisticBoundSkills.length > 0 && (
+                          <SkillBadgeBar
+                            threadId={threadId}
+                            boundSkills={optimisticBoundSkills}
+                            onUnbind={
+                              pendingBind && boundSkills.length === 0
+                                ? () => setPendingBind(null)
+                                : undefined
+                            }
+                          />
+                        )}
+                      </div>
                     }
                     disabled={
                       env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" ||

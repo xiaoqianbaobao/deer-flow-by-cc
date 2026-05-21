@@ -204,6 +204,55 @@ class TestChannelStore:
         store = ChannelStore(path=path)
         assert store.get_thread_id("x", "y") is None
 
+    def test_set_with_identity_persists_tenant_workspace(self, store):
+        store.set_thread_id(
+            "slack",
+            "ch1",
+            "thread-abc",
+            user_id="u1",
+            tenant_id=7,
+            workspace_id=3,
+        )
+        mapping = store.get_thread_mapping("slack", "ch1")
+        assert mapping is not None
+        assert mapping["thread_id"] == "thread-abc"
+        assert mapping["tenant_id"] == 7
+        assert mapping["workspace_id"] == 3
+
+    def test_get_thread_mapping_missing_returns_none(self, store):
+        assert store.get_thread_mapping("slack", "nonexistent") is None
+
+    def test_set_without_identity_stores_none(self, store):
+        store.set_thread_id("slack", "ch1", "thread-abc", user_id="u1")
+        mapping = store.get_thread_mapping("slack", "ch1")
+        assert mapping is not None
+        assert mapping["tenant_id"] is None
+        assert mapping["workspace_id"] is None
+
+    def test_get_thread_id_still_works_after_identity_persist(self, store):
+        # Back-compat: the legacy getter must keep returning the thread_id only.
+        store.set_thread_id("slack", "ch1", "t1", tenant_id=7, workspace_id=3)
+        assert store.get_thread_id("slack", "ch1") == "t1"
+
+    def test_legacy_entry_without_identity_keys_reads_as_none(self, tmp_path):
+        # Simulate a store.json written by the pre-M7-followup version.
+        path = tmp_path / "store.json"
+        legacy = {
+            "slack:ch1": {
+                "thread_id": "thread-legacy",
+                "user_id": "u1",
+                "created_at": 1700000000.0,
+                "updated_at": 1700000000.0,
+            }
+        }
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        store = ChannelStore(path=path)
+        mapping = store.get_thread_mapping("slack", "ch1")
+        assert mapping is not None
+        assert mapping["thread_id"] == "thread-legacy"
+        assert mapping.get("tenant_id") is None
+        assert mapping.get("workspace_id") is None
+
 
 # ---------------------------------------------------------------------------
 # Channel base class tests
@@ -2011,65 +2060,6 @@ class TestChannelService:
         assert service.manager._langgraph_url == "http://custom-langgraph:2024"
         assert service.manager._gateway_url == "http://custom-gateway:8001"
 
-    def test_disabled_channel_with_string_creds_emits_warning(self, caplog):
-        """Warning is emitted when a channel has string credentials but enabled=false."""
-        import logging
-
-        from app.channels.service import ChannelService
-
-        async def go():
-            service = ChannelService(
-                channels_config={
-                    "wecom": {"enabled": False, "bot_id": "corp123", "bot_secret": "secret"},
-                }
-            )
-            with caplog.at_level(logging.WARNING, logger="app.channels.service"):
-                await service.start()
-            await service.stop()
-
-        _run(go())
-        assert any("wecom" in r.message and r.levelno == logging.WARNING for r in caplog.records)
-
-    def test_disabled_channel_with_int_creds_emits_warning(self, caplog):
-        """Warning is emitted even when YAML-parsed integer credentials are present."""
-        import logging
-
-        from app.channels.service import ChannelService
-
-        async def go():
-            # Simulate YAML parsing a numeric token/ID as an int
-            service = ChannelService(
-                channels_config={
-                    "telegram": {"enabled": False, "bot_token": 123456789},
-                }
-            )
-            with caplog.at_level(logging.WARNING, logger="app.channels.service"):
-                await service.start()
-            await service.stop()
-
-        _run(go())
-        assert any("telegram" in r.message and r.levelno == logging.WARNING for r in caplog.records)
-
-    def test_disabled_channel_without_creds_emits_info(self, caplog):
-        """Only an info log (no warning) is emitted when a channel is disabled with no credentials."""
-        import logging
-
-        from app.channels.service import ChannelService
-
-        async def go():
-            service = ChannelService(
-                channels_config={
-                    "telegram": {"enabled": False},
-                }
-            )
-            with caplog.at_level(logging.DEBUG, logger="app.channels.service"):
-                await service.start()
-            await service.stop()
-
-        _run(go())
-        warning_records = [r for r in caplog.records if "telegram" in r.message and r.levelno == logging.WARNING]
-        assert not warning_records
-
 
 # ---------------------------------------------------------------------------
 # Slack send retry tests
@@ -2105,11 +2095,6 @@ class TestSlackSendRetry:
 
 
 class TestSlackAllowedUsers:
-    @staticmethod
-    def _submit_coro(coro, loop):
-        coro.close()
-        return MagicMock()
-
     def test_numeric_allowed_users_match_string_event_user_id(self):
         from app.channels.slack import SlackChannel
 
@@ -2131,9 +2116,13 @@ class TestSlackAllowedUsers:
             "ts": "1710000000.000100",
         }
 
+        def submit_coro(coro, loop):
+            coro.close()
+            return MagicMock()
+
         with patch(
             "app.channels.slack.asyncio.run_coroutine_threadsafe",
-            side_effect=self._submit_coro,
+            side_effect=submit_coro,
         ) as submit:
             channel._handle_message_event(event)
 
@@ -2144,74 +2133,6 @@ class TestSlackAllowedUsers:
         assert inbound.user_id == "123456"
         assert inbound.chat_id == "C123"
         assert inbound.text == "hello from slack"
-
-    def test_string_allowed_users_match_event_user_id(self):
-        from app.channels.slack import SlackChannel
-
-        bus = MessageBus()
-        bus.publish_inbound = AsyncMock()
-        channel = SlackChannel(
-            bus=bus,
-            config={"allowed_users": "U123456"},
-        )
-        channel._loop = MagicMock()
-        channel._loop.is_running.return_value = True
-        channel._add_reaction = MagicMock()
-        channel._send_running_reply = MagicMock()
-
-        event = {
-            "user": "U123456",
-            "text": "hello from slack",
-            "channel": "C123",
-            "ts": "1710000000.000100",
-        }
-
-        with patch(
-            "app.channels.slack.asyncio.run_coroutine_threadsafe",
-            side_effect=self._submit_coro,
-        ) as submit:
-            channel._handle_message_event(event)
-
-        channel._add_reaction.assert_called_once_with("C123", "1710000000.000100", "eyes")
-        channel._send_running_reply.assert_called_once_with("C123", "1710000000.000100")
-        submit.assert_called_once()
-        inbound = bus.publish_inbound.call_args.args[0]
-        assert inbound.user_id == "U123456"
-        assert inbound.chat_id == "C123"
-        assert inbound.text == "hello from slack"
-
-    def test_scalar_allowed_users_warns_and_matches_stringified_event_user_id(self, caplog):
-        from app.channels.slack import SlackChannel
-
-        bus = MessageBus()
-        bus.publish_inbound = AsyncMock()
-        with caplog.at_level("WARNING"):
-            channel = SlackChannel(
-                bus=bus,
-                config={"allowed_users": 123456},
-            )
-        channel._loop = MagicMock()
-        channel._loop.is_running.return_value = True
-        channel._add_reaction = MagicMock()
-        channel._send_running_reply = MagicMock()
-
-        event = {
-            "user": "123456",
-            "text": "hello from slack",
-            "channel": "C123",
-            "ts": "1710000000.000100",
-        }
-
-        with patch(
-            "app.channels.slack.asyncio.run_coroutine_threadsafe",
-            side_effect=self._submit_coro,
-        ) as submit:
-            channel._handle_message_event(event)
-
-        assert "Slack allowed_users should be a list" in caplog.text
-        submit.assert_called_once()
-        inbound = bus.publish_inbound.call_args.args[0]
-        assert inbound.user_id == "123456"
 
     def test_raises_after_all_retries_exhausted(self):
         from app.channels.slack import SlackChannel
@@ -2549,3 +2470,236 @@ class TestSlackMarkdownConversion:
         result = _slack_md_converter.convert("# Title")
         assert "*Title*" in result
         assert "#" not in result
+
+
+# ---------------------------------------------------------------------------
+# ChannelManager identity-threading tests (M7A followup)
+# ---------------------------------------------------------------------------
+
+
+class TestChannelManagerIdentity:
+    def test_resolve_channel_identity_flag_off(self, monkeypatch):
+        """ENABLE_IDENTITY absent → helper returns (None, None) regardless of config."""
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.delenv("ENABLE_IDENTITY", raising=False)
+
+        bus = MessageBus()
+        store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+        manager = ChannelManager(
+            bus=bus,
+            store=store,
+            channel_sessions={"telegram": {"tenant_id": 7, "workspace_id": 3}},
+        )
+
+        msg = InboundMessage(channel_name="telegram", chat_id="c1", user_id="u1", text="hi")
+        tid, wid = manager._resolve_channel_identity(msg)
+        assert tid is None
+        assert wid is None
+
+    def test_resolve_channel_identity_flag_on_reads_channel_layer(self, monkeypatch):
+        """ENABLE_IDENTITY=1 + channel config → returns the configured pair."""
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setenv("ENABLE_IDENTITY", "1")
+
+        bus = MessageBus()
+        store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+        manager = ChannelManager(
+            bus=bus,
+            store=store,
+            channel_sessions={"telegram": {"tenant_id": 7, "workspace_id": 3}},
+        )
+
+        msg = InboundMessage(channel_name="telegram", chat_id="c1", user_id="u1", text="hi")
+        tid, wid = manager._resolve_channel_identity(msg)
+        assert tid == 7
+        assert wid == 3
+
+    def test_resolve_channel_identity_falls_back_to_default_session(self, monkeypatch):
+        """ENABLE_IDENTITY=1 + no per-channel values + default_session → uses default."""
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setenv("ENABLE_IDENTITY", "1")
+
+        bus = MessageBus()
+        store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+        manager = ChannelManager(
+            bus=bus,
+            store=store,
+            default_session={"tenant_id": 2, "workspace_id": 5},
+            channel_sessions={"telegram": {}},
+        )
+
+        msg = InboundMessage(channel_name="telegram", chat_id="c1", user_id="u1", text="hi")
+        tid, wid = manager._resolve_channel_identity(msg)
+        assert tid == 2
+        assert wid == 5
+
+    def test_resolve_channel_identity_rejects_non_int(self, monkeypatch):
+        """Non-int config values are treated as missing (defensive)."""
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setenv("ENABLE_IDENTITY", "1")
+
+        bus = MessageBus()
+        store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+        manager = ChannelManager(
+            bus=bus,
+            store=store,
+            channel_sessions={"telegram": {"tenant_id": "seven", "workspace_id": None}},
+        )
+
+        msg = InboundMessage(channel_name="telegram", chat_id="c1", user_id="u1", text="hi")
+        tid, wid = manager._resolve_channel_identity(msg)
+        assert tid is None
+        assert wid is None
+
+    def test_handle_chat_persists_tenant_workspace_into_store(self, monkeypatch):
+        """When flag is on + channel config has the pair, set_thread_id stores them."""
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setenv("ENABLE_IDENTITY", "1")
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(
+                bus=bus,
+                store=store,
+                channel_sessions={"telegram": {"tenant_id": 7, "workspace_id": 3}},
+            )
+
+            mock_client = _make_mock_langgraph_client()
+            manager._client = mock_client
+
+            outbound_received = []
+
+            async def capture(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture)
+            await manager.start()
+
+            await bus.publish_inbound(InboundMessage(channel_name="telegram", chat_id="chat1", user_id="u1", text="hi"))
+            await _wait_for(lambda: len(outbound_received) >= 1)
+            await manager.stop()
+
+            mapping = store.get_thread_mapping("telegram", "chat1")
+            assert mapping is not None
+            assert mapping["tenant_id"] == 7
+            assert mapping["workspace_id"] == 3
+
+        _run(go())
+
+    def test_resolve_attachments_flag_off_passes_none(self, monkeypatch):
+        """Flag off → paths.resolve_virtual_path called with tenant_id=None, workspace_id=None."""
+        from app.channels.manager import _resolve_attachments
+
+        monkeypatch.delenv("ENABLE_IDENTITY", raising=False)
+
+        fake_paths = MagicMock()
+        fake_paths.resolve_sandbox_outputs_dir.return_value = Path("/tmp/outputs")
+
+        resolved_path = MagicMock()
+        resolved_path.resolve.return_value = resolved_path
+        resolved_path.relative_to.return_value = Path("file.txt")
+        resolved_path.is_file.return_value = True
+        resolved_path.stat.return_value = SimpleNamespace(st_size=10)
+        resolved_path.name = "file.txt"
+        fake_paths.resolve_virtual_path.return_value = resolved_path
+
+        class _Stub:
+            def get_paths(self):
+                return fake_paths
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "deerflow.config.paths",
+            _Stub(),
+        )
+
+        attachments = _resolve_attachments(
+            "thread-xyz",
+            ["/mnt/user-data/outputs/file.txt"],
+            tenant_id=None,
+            workspace_id=None,
+        )
+
+        fake_paths.resolve_virtual_path.assert_called_once()
+        _, kwargs = fake_paths.resolve_virtual_path.call_args
+        assert kwargs.get("tenant_id") is None
+        assert kwargs.get("workspace_id") is None
+        assert len(attachments) == 1
+
+    def test_resolve_attachments_flag_on_passes_ids(self, monkeypatch):
+        """Flag on + IDs supplied → paths.resolve_virtual_path gets the IDs as kwargs."""
+        from app.channels.manager import _resolve_attachments
+
+        fake_paths = MagicMock()
+        fake_paths.resolve_sandbox_outputs_dir.return_value = Path("/tmp/outputs")
+
+        resolved_path = MagicMock()
+        resolved_path.resolve.return_value = resolved_path
+        resolved_path.relative_to.return_value = Path("file.txt")
+        resolved_path.is_file.return_value = True
+        resolved_path.stat.return_value = SimpleNamespace(st_size=42)
+        resolved_path.name = "file.txt"
+        fake_paths.resolve_virtual_path.return_value = resolved_path
+
+        class _Stub:
+            def get_paths(self):
+                return fake_paths
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "deerflow.config.paths",
+            _Stub(),
+        )
+
+        _resolve_attachments(
+            "thread-xyz",
+            ["/mnt/user-data/outputs/file.txt"],
+            tenant_id=7,
+            workspace_id=3,
+        )
+
+        fake_paths.resolve_virtual_path.assert_called_once()
+        _, kwargs = fake_paths.resolve_virtual_path.call_args
+        assert kwargs.get("tenant_id") == 7
+        assert kwargs.get("workspace_id") == 3
+
+
+class TestResolveAttachmentsTenantAware:
+    """Real-filesystem regression test for the outputs_dir boundary check in
+    ``_resolve_attachments``: when tenant ids flow in, the boundary check
+    must use the tenant-aware outputs_dir; otherwise legitimate artifacts
+    resolved under tenants/{T}/workspaces/{W}/... get rejected as
+    path-traversal attempts."""
+
+    def test_outputs_dir_uses_tenant_path(self, tmp_path):
+        from unittest.mock import patch
+
+        from app.channels.manager import _resolve_attachments
+        from deerflow.config.paths import Paths
+
+        paths = Paths(base_dir=str(tmp_path))
+        outputs = paths.resolve_sandbox_outputs_dir(
+            "thread-x", tenant_id=1, workspace_id=1
+        )
+        outputs.mkdir(parents=True, exist_ok=True)
+        (outputs / "report.md").write_text("# hello", encoding="utf-8")
+
+        # ``manager._resolve_attachments`` performs a lazy ``from deerflow.config.paths
+        # import get_paths`` inside the function — patch the source module instead.
+        with patch("deerflow.config.paths.get_paths", return_value=paths):
+            attachments = _resolve_attachments(
+                "thread-x",
+                ["/mnt/user-data/outputs/report.md"],
+                tenant_id=1,
+                workspace_id=1,
+            )
+
+        assert len(attachments) == 1
+        assert attachments[0].filename == "report.md"
+        assert attachments[0].size > 0

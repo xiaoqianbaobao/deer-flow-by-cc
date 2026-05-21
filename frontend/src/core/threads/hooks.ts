@@ -8,6 +8,10 @@ import { toast } from "sonner";
 import type { PromptInputMessage } from "@/components/ai-elements/prompt-input";
 
 import { getAPIClient } from "../api";
+import {
+  extractInvalidatedPathsFromNewMessages,
+  extractToolEndEventsFromNewMessages,
+} from "../artifacts/invalidation";
 import { getBackendBaseURL } from "../config";
 import { useI18n } from "../i18n/hooks";
 import type { FileInMessage } from "../messages/utils";
@@ -220,14 +224,6 @@ export function useThreadStream({
           .catch(() => ({}));
       }
     },
-    onLangChainEvent(event) {
-      if (event.event === "on_tool_end") {
-        listeners.current.onToolEnd?.({
-          name: event.name,
-          data: event.data,
-        });
-      }
-    },
     onUpdateEvent(data) {
       const updates: Array<Partial<AgentThreadState> | null> = Object.values(
         data || {},
@@ -322,6 +318,39 @@ export function useThreadStream({
       setOptimisticMessages([]);
     }
   }, [thread.messages.length, optimisticMessages.length]);
+
+  // Watch thread.messages for newly-arrived ToolMessages so we can:
+  //   1. Invalidate artifact caches when write_file/str_replace finishes
+  //   2. Forward a tool-end event to the optional onToolEnd consumer
+  // The previous implementation relied on `onLangChainEvent`, but that
+  // callback never fires because deer-flow's useStream config does not
+  // include "events" in streamMode. Diagnosing via thread.messages is
+  // robust against that — messages-tuple stream is always enabled.
+  const prevMessagesRef = useRef<Message[]>([]);
+  useEffect(() => {
+    const before = prevMessagesRef.current;
+    const after = thread.messages;
+    if (after.length > before.length) {
+      const events = extractToolEndEventsFromNewMessages(before, after);
+      for (const event of events) {
+        listeners.current.onToolEnd?.(event);
+      }
+      const paths = extractInvalidatedPathsFromNewMessages(before, after);
+      for (const path of paths) {
+        void queryClient.invalidateQueries({
+          queryKey: ["artifact", path],
+          exact: false,
+        });
+      }
+    }
+    prevMessagesRef.current = after;
+  }, [thread.messages, queryClient]);
+
+  // Reset the messages baseline when switching threads so the watcher does
+  // not treat a thread's existing history as "new" arrivals.
+  useEffect(() => {
+    prevMessagesRef.current = [];
+  }, [threadId]);
 
   const sendMessage = useCallback(
     async (
@@ -490,6 +519,7 @@ export function useThreadStream({
             context: {
               ...extraContext,
               ...context,
+              agent_name: context.agent_name,
               thinking_enabled: context.mode !== "flash",
               is_plan_mode: context.mode === "pro" || context.mode === "ultra",
               subagent_enabled: context.mode === "ultra",

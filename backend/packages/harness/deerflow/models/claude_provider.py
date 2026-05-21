@@ -190,33 +190,23 @@ class ClaudeChatModel(ChatAnthropic):
             )
 
     def _apply_prompt_caching(self, payload: dict) -> None:
-        """Apply ephemeral cache_control to system, recent messages, and last tool definition.
-
-        Uses a budget of MAX_CACHE_BREAKPOINTS (4) breakpoints — the hard limit
-        enforced by both the Anthropic API and AWS Bedrock.  Breakpoints are
-        placed on the *last* eligible blocks because later breakpoints cover a
-        larger prefix and yield better cache hit rates.
-        """
-        MAX_CACHE_BREAKPOINTS = 4
-
-        # Collect candidate blocks in document order:
-        #   1. system text blocks
-        #   2. content blocks of the last prompt_cache_size messages
-        #   3. the last tool definition
-        candidates: list[dict] = []
-
-        # 1. System blocks
+        """Apply ephemeral cache_control to system and recent messages."""
+        # Cache system messages
         system = payload.get("system")
         if system and isinstance(system, list):
             for block in system:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    candidates.append(block)
+                    block["cache_control"] = {"type": "ephemeral"}
         elif system and isinstance(system, str):
-            new_block: dict = {"type": "text", "text": system}
-            payload["system"] = [new_block]
-            candidates.append(new_block)
+            payload["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
 
-        # 2. Recent message blocks
+        # Cache recent messages
         messages = payload.get("messages", [])
         cache_start = max(0, len(messages) - self.prompt_cache_size)
         for i in range(cache_start, len(messages)):
@@ -227,21 +217,20 @@ class ClaudeChatModel(ChatAnthropic):
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict):
-                        candidates.append(block)
+                        block["cache_control"] = {"type": "ephemeral"}
             elif isinstance(content, str) and content:
-                new_block = {"type": "text", "text": content}
-                msg["content"] = [new_block]
-                candidates.append(new_block)
+                msg["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
 
-        # 3. Last tool definition
+        # Cache the last tool definition
         tools = payload.get("tools", [])
         if tools and isinstance(tools[-1], dict):
-            candidates.append(tools[-1])
-
-        # Apply cache_control only to the last MAX_CACHE_BREAKPOINTS candidates
-        # to stay within the API limit.
-        for block in candidates[-MAX_CACHE_BREAKPOINTS:]:
-            block["cache_control"] = {"type": "ephemeral"}
+            tools[-1]["cache_control"] = {"type": "ephemeral"}
 
     def _apply_thinking_budget(self, payload: dict) -> None:
         """Auto-allocate thinking budget (80% of max_tokens)."""

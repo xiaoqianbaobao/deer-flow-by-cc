@@ -30,15 +30,34 @@ def validate_thread_id(thread_id: str) -> None:
         raise ValueError(f"Invalid thread_id: {thread_id!r}")
 
 
-def get_uploads_dir(thread_id: str) -> Path:
-    """Return the uploads directory path for a thread (no side effects)."""
+def get_uploads_dir(
+    thread_id: str,
+    *,
+    tenant_id: int | None = None,
+    workspace_id: int | None = None,
+) -> Path:
+    """Return the uploads directory path for a thread (no side effects).
+
+    When both ``tenant_id`` and ``workspace_id`` are positive ints, the result
+    is routed under ``tenants/{tid}/workspaces/{wid}/threads/.../user-data/uploads``
+    (M4 storage isolation). When either id is missing, the legacy layout is
+    used verbatim — keeps flag-off / anonymous callers unaffected.
+    """
     validate_thread_id(thread_id)
-    return get_paths().sandbox_uploads_dir(thread_id)
+    return get_paths().resolve_sandbox_uploads_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
 
 
-def ensure_uploads_dir(thread_id: str) -> Path:
-    """Return the uploads directory for a thread, creating it if needed."""
-    base = get_uploads_dir(thread_id)
+def ensure_uploads_dir(
+    thread_id: str,
+    *,
+    tenant_id: int | None = None,
+    workspace_id: int | None = None,
+) -> Path:
+    """Return the uploads directory for a thread, creating it if needed.
+
+    See :func:`get_uploads_dir` for tenant/workspace semantics.
+    """
+    base = get_uploads_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
     base.mkdir(parents=True, exist_ok=True)
     return base
 

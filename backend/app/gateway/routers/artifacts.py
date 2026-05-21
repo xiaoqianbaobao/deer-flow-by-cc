@@ -1,5 +1,6 @@
 import logging
 import mimetypes
+import re
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -7,11 +8,21 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 
+from app.gateway.identity.request_scope import extract_scope
+from app.gateway.identity.storage.path_guard import PathEscapeError, assert_within_tenant_root
 from app.gateway.path_utils import resolve_thread_virtual_path
+from deerflow.config.paths import get_paths
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["artifacts"])
+
+
+def _extract_scope(request: Request | None) -> tuple[int | None, int | None]:
+    """Backward-compat alias retained for in-file callers; delegates to the
+    shared :func:`app.gateway.identity.request_scope.extract_scope`."""
+    return extract_scope(request)
+
 
 ACTIVE_CONTENT_MIME_TYPES = {
     "text/html",
@@ -30,6 +41,58 @@ def _build_attachment_headers(filename: str, extra_headers: dict[str, str] | Non
     if extra_headers:
         headers.update(extra_headers)
     return headers
+
+
+_TENANT_DIR_RE = re.compile(r"^\d+$")
+
+
+def _legacy_tenant_fallback(thread_id: str, virtual_path: str) -> Path | None:
+    """Locate ``thread_id`` under the tenant-stratified tree when the legacy
+    flat path doesn't exist.
+
+    Anonymous callers (no identity in ``request.state``) hit the legacy resolver
+    which looks under ``$DEER_FLOW_HOME/threads/{thread_id}``. After M4 most new
+    threads only live under ``tenants/{tid}/workspaces/{wid}/threads/{thread_id}``
+    with no legacy symlink, so the legacy lookup 404s.
+
+    This walker scans ``tenants/*/workspaces/*/threads/{thread_id}`` once and
+    re-resolves through the tenant-aware path helper if exactly one candidate
+    is found. Multiple matches (collision across tenants) are rejected — the
+    caller has no way to disambiguate without a verified identity.
+
+    Returns ``None`` when no candidate exists or the candidate is ambiguous;
+    the caller should treat that as a 404. ``ValueError`` from the resolver
+    (invalid virtual path) is re-raised so the 400/403 surfaces unchanged.
+    """
+    base_dir = get_paths().base_dir
+    tenants_root = base_dir / "tenants"
+    if not tenants_root.is_dir():
+        return None
+
+    candidates: list[tuple[int, int]] = []
+    for tenant_dir in tenants_root.iterdir():
+        if not tenant_dir.is_dir() or not _TENANT_DIR_RE.match(tenant_dir.name):
+            continue
+        workspaces_root = tenant_dir / "workspaces"
+        if not workspaces_root.is_dir():
+            continue
+        for workspace_dir in workspaces_root.iterdir():
+            if not workspace_dir.is_dir() or not _TENANT_DIR_RE.match(workspace_dir.name):
+                continue
+            if (workspace_dir / "threads" / thread_id).is_dir():
+                candidates.append((int(tenant_dir.name), int(workspace_dir.name)))
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            logger.warning(
+                "artifact.fallback.ambiguous thread=%s candidates=%s",
+                thread_id,
+                candidates,
+            )
+        return None
+
+    tid, wid = candidates[0]
+    return resolve_thread_virtual_path(thread_id, virtual_path, tenant_id=tid, workspace_id=wid)
 
 
 def is_text_file_by_content(path: Path, sample_size: int = 8192) -> bool:
@@ -114,6 +177,49 @@ async def get_artifact(thread_id: str, path: str, request: Request, download: bo
         - Download file: `/api/threads/abc123/artifacts/mnt/user-data/outputs/data.csv?download=true`
         - Active web content such as `.html`, `.xhtml`, and `.svg` artifacts is always downloaded
     """
+    tid, wid = _extract_scope(request)
+
+    def _resolve(virtual_path: str) -> Path:
+        if tid is not None and wid is not None:
+            # Intercept the resolver's 403 (``"Access denied: path traversal
+            # detected"``) and rewrite the body to a generic ``"Access denied"``
+            # so the client can't probe for path-shape hints. 400s pass through
+            # unchanged — they describe bad input, not policy decisions.
+            try:
+                actual = resolve_thread_virtual_path(thread_id, virtual_path, tenant_id=tid, workspace_id=wid)
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    logger.warning(
+                        "authz.path.denied thread=%s tenant=%s reason=%s",
+                        thread_id,
+                        tid,
+                        exc.detail,
+                    )
+                    raise HTTPException(status_code=403, detail="Access denied") from None
+                raise
+            try:
+                assert_within_tenant_root(actual, tid)
+            except PathEscapeError as exc:
+                logger.warning(
+                    "authz.path.denied thread=%s tenant=%s reason=%s",
+                    thread_id,
+                    tid,
+                    exc,
+                )
+                raise HTTPException(status_code=403, detail="Access denied") from None
+            return actual
+        # Legacy / anonymous branch: try the flat path first, then fall back
+        # to a tenant-tree scan so artifacts created post-M4 (which no longer
+        # leave a legacy symlink) remain reachable when the request can't be
+        # authenticated. Tenant-scoped callers bypass this entirely above.
+        legacy = resolve_thread_virtual_path(thread_id, virtual_path)
+        if legacy.exists():
+            return legacy
+        fallback = _legacy_tenant_fallback(thread_id, virtual_path)
+        if fallback is not None:
+            return fallback
+        return legacy
+
     # Check if this is a request for a file inside a .skill archive (e.g., xxx.skill/SKILL.md)
     if ".skill/" in path:
         # Split the path at ".skill/" to get the ZIP file path and internal path
@@ -122,7 +228,7 @@ async def get_artifact(thread_id: str, path: str, request: Request, download: bo
         skill_file_path = path[: marker_pos + len(".skill")]  # e.g., "mnt/user-data/outputs/my-skill.skill"
         internal_path = path[marker_pos + len(skill_marker) :]  # e.g., "SKILL.md"
 
-        actual_skill_path = resolve_thread_virtual_path(thread_id, skill_file_path)
+        actual_skill_path = _resolve(skill_file_path)
 
         if not actual_skill_path.exists():
             raise HTTPException(status_code=404, detail=f"Skill file not found: {skill_file_path}")
@@ -152,7 +258,7 @@ async def get_artifact(thread_id: str, path: str, request: Request, download: bo
         except UnicodeDecodeError:
             return Response(content=content, media_type=mime_type or "application/octet-stream", headers=cache_headers)
 
-    actual_path = resolve_thread_virtual_path(thread_id, path)
+    actual_path = _resolve(path)
 
     logger.info(f"Resolving artifact path: thread_id={thread_id}, requested_path={path}, actual_path={actual_path}")
 

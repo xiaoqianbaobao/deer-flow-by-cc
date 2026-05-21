@@ -116,6 +116,7 @@ export interface Translations {
     chats: string;
     demoChats: string;
     agents: string;
+    skills: string;
   };
 
   // Agents
@@ -151,6 +152,29 @@ export interface Translations {
     agentCreated: string;
     startChatting: string;
     backToGallery: string;
+    edit: string;
+    editPageTitle: string;
+    editBasicSection: string;
+    editAdvancedSection: string;
+    editFieldDescription: string;
+    editFieldDescriptionPlaceholder: string;
+    editFieldModel: string;
+    editFieldModelDefault: string;
+    editFieldSoul: string;
+    editFieldSoulPlaceholder: string;
+    editFieldToolGroups: string;
+    editFieldSkills: string;
+    editFieldOrgKeyEnv: string;
+    editFieldOrgKeyEnvPlaceholder: string;
+    editUseAllToolGroups: string;
+    editUseAllSkills: string;
+    editSaveSuccess: string;
+    editSaveFailed: string;
+    editLoadFailed: string;
+    editLoadFailedBack: string;
+    editVersionPinned: string;
+    editToolGroupsLoadFailed: string;
+    editSkillsLoadFailed: string;
   };
 
   // Breadcrumb
@@ -174,6 +198,8 @@ export interface Translations {
   conversation: {
     noMessages: string;
     startConversation: string;
+    earlyMessages: string;
+    earlyMessagesDescription: (count: number) => string;
   };
 
   // Chats
@@ -371,6 +397,150 @@ export interface Translations {
     acknowledge: {
       emptyTitle: string;
       emptyDescription: string;
+    };
+  };
+
+  // M7 A6: identity admin surface (left nav + page titles + key actions).
+  // Inline form copy + dialog descriptions stay English by default — only
+  // the high-frequency labels are localised to keep the translation surface
+  // small. Add more strings when zh-CN ergonomics demand it.
+  admin: {
+    nav: {
+      tenants: string;
+      users: string;
+      roles: string;
+      workspaces: string;
+      tokens: string;
+      audit: string;
+      skills: string;
+      profile: string;
+      orgKeys: string;
+      models: string;
+    };
+    pages: {
+      tenantsTitle: string;
+      usersTitle: string;
+      rolesTitle: string;
+      rolesScopePlatform: string;
+      rolesScopeTenant: string;
+      rolesScopeWorkspace: string;
+      rolesBuiltinTag: string;
+      workspacesTitle: string;
+      tokensTitle: string;
+      auditTitle: string;
+      skillsTitle: string;
+      profileTitle: string;
+      modelsTitle: string;
+    };
+    actions: {
+      newToken: string;
+      newUser: string;
+      newTenant: string;
+      newWorkspace: string;
+      addMember: string;
+      revoke: string;
+      remove: string;
+      cancel: string;
+      confirm: string;
+      copy: string;
+      copied: string;
+      done: string;
+      exportCsv: string;
+      signOut: string;
+      rename: string;
+      delete: string;
+      save: string;
+      saveChanges: string;
+    };
+    profile: {
+      tabBasic: string;
+      tabMyTokens: string;
+      tabMySessions: string;
+      activeTenant: string;
+      workspaces: string;
+      permissions: string;
+    };
+    forms: {
+      slugLabel: string;
+      slugHint: string;
+      displayNameLabel: string;
+      emailLabel: string;
+      tenantCreateTitle: string;
+      tenantCreateDesc: string;
+      tenantRenameTitle: string;
+      tenantRenameDesc: string;
+      workspaceCreateTitle: string;
+      workspaceCreateDesc: string;
+      workspaceRenameTitle: string;
+      workspaceRenameDesc: string;
+    };
+    audit: {
+      filterAction: string;
+      filterUserId: string;
+      filterResource: string;
+      filterResult: string;
+      resultAll: string;
+      resultSuccess: string;
+      resultFailure: string;
+      noEvents: string;
+      detailResult: string;
+      detailUserId: string;
+      detailTenantId: string;
+      detailWorkspaceId: string;
+      detailThreadId: string;
+      detailResourceType: string;
+      detailResourceId: string;
+      detailIp: string;
+      detailUserAgent: string;
+      detailDuration: string;
+      detailErrorCode: string;
+      detailMetadata: string;
+      close: string;
+    };
+    tokens: {
+      showRevoked: string;
+      createTitle: string;
+      createDesc: string;
+      nameLabel: string;
+      scopesLabel: string;
+      createdTitle: string;
+      createdDesc: string;
+    };
+    tenantSwitcher: {
+      label: string;
+    };
+    table: {
+      colSlug: string;
+      colName: string;
+      colMembers: string;
+      colCreated: string;
+      colPlan: string;
+      colStatus: string;
+      colEmail: string;
+      colRoles: string;
+      colLastLogin: string;
+      colPrefix: string;
+      colScopes: string;
+      colLastUsed: string;
+      colRole: string;
+      colJoined: string;
+      colTimeUtc: string;
+      colActor: string;
+      colAction: string;
+      colResource: string;
+      colResult: string;
+      loading: string;
+      prev: string;
+      next: string;
+      statusActive: string;
+      statusDisabled: string;
+      statusRevoked: string;
+      details: string;
+      membersLink: string;
+      manageMembers: string;
+      backToWorkspaces: string;
+      backToTenants: string;
+      backToUsers: string;
     };
   };
 }

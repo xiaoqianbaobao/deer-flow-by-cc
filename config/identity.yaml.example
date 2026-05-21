@@ -1,0 +1,65 @@
+# DeerFlow Identity — OIDC provider configuration (template)
+#
+# Copy to `config/identity.yaml` and fill in provider credentials. The loader
+# resolves `$VAR` references against the process environment, so secrets can
+# stay in env files outside the repo.
+#
+# Only providers listed here are available at /api/auth/oidc/{provider}/login.
+
+oidc:
+  providers:
+    # Okta
+    okta:
+      issuer: https://YOUR_DOMAIN.okta.com
+      client_id: $OKTA_CLIENT_ID
+      client_secret: $OKTA_CLIENT_SECRET
+      scopes: [openid, profile, email]
+
+    # Azure AD / Entra ID
+    # azure:
+    #   issuer: https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0
+    #   client_id: $AZURE_CLIENT_ID
+    #   client_secret: $AZURE_CLIENT_SECRET
+    #   scopes: [openid, profile, email]
+
+    # Keycloak (self-hosted)
+    # keycloak:
+    #   issuer: https://YOUR_KEYCLOAK/realms/YOUR_REALM
+    #   client_id: $KC_CLIENT_ID
+    #   client_secret: $KC_CLIENT_SECRET
+    #   scopes: [openid, profile, email]
+
+    # Generic provider with explicit endpoints (no discovery)
+    # custom:
+    #   issuer: https://idp.example.com
+    #   client_id: $CUSTOM_CLIENT_ID
+    #   client_secret: $CUSTOM_CLIENT_SECRET
+    #   authorize_url: https://idp.example.com/oauth2/authorize
+    #   token_url: https://idp.example.com/oauth2/token
+    #   jwks_uri: https://idp.example.com/.well-known/jwks.json
+
+# ---------------------------------------------------------------------------
+# sensitive_global_only (M4 §7.3) — informational reference only
+# ---------------------------------------------------------------------------
+#
+# The following dotted paths may only be set in this GLOBAL config file;
+# tenant-level (`{DEER_FLOW_HOME}/tenants/{tid}/config.yaml`) and
+# workspace-level (`.../workspaces/{wid}/config.yaml`) overlays that
+# attempt to set them will be rejected with `SensitiveFieldViolation`.
+#
+# The **authoritative** list lives in code at
+# `backend/app/gateway/identity/storage/config_layers.py` —
+# `SENSITIVE_GLOBAL_ONLY`. This block is kept in sync manually for
+# discoverability; do not rely on it at runtime.
+#
+# DSL:
+#   a.b.c      -- literal dotted path
+#   a[*].b     -- list at `a`, field `b` on every element
+#
+# sensitive_global_only:
+#   - models[*].api_key
+#   - models[*].endpoint
+#   - models[*].base_url
+#   - sandbox.provisioner.api_key
+#   - sandbox.provisioner.endpoint
+#   - memory.storage_path

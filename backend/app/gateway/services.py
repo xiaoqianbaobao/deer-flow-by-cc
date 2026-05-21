@@ -188,7 +188,91 @@ def build_run_config(
 # ---------------------------------------------------------------------------
 
 
-async def _upsert_thread_in_store(store, thread_id: str, metadata: dict | None) -> None:
+def _extract_workspace_id_for_run(request: Request, config: dict[str, Any]) -> int | None:
+    """Best-effort active-workspace resolution.
+
+    The active workspace (the ``X-Deerflow-Workspace-Id`` header) is the
+    one the run belongs to. Priority order:
+
+    1. Explicit ``configurable["workspace_id"]`` from the client
+    2. Path parameter on the originating request (``/tenants/{tid}/workspaces/{wid}/...``)
+    3. Identity's first workspace membership (most runs today don't know
+       which workspace they belong to and legacy routes set nothing)
+
+    Returns ``None`` when nothing resolves — the signer accepts that and
+    omits the workspace header, which the harness side treats as "no
+    active workspace" (IdentityMiddleware still populates identity).
+    """
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    explicit = configurable.get("workspace_id") if isinstance(configurable, dict) else None
+    if isinstance(explicit, int):
+        return explicit
+    if isinstance(explicit, str) and explicit.isdigit():
+        return int(explicit)
+
+    path_params = getattr(request, "path_params", None) or {}
+    for candidate in ("workspace_id", "wid", "ws_id"):
+        raw = path_params.get(candidate) if isinstance(path_params, dict) else None
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+
+    identity = getattr(request.state, "identity", None)
+    workspace_ids = getattr(identity, "workspace_ids", ()) if identity is not None else ()
+    if workspace_ids:
+        return workspace_ids[0]
+
+    return None
+
+
+def _inject_identity_headers(config: dict[str, Any], request: Request) -> None:
+    """Sign and stash identity headers under ``configurable["headers"]``.
+
+    The LangGraph-side :class:`IdentityMiddleware` reads that slot to
+    populate ``state["identity"]``. Silently no-ops in any of:
+
+    * Identity subsystem disabled
+    * Signing key not configured
+    * Caller is anonymous (no identity middleware ran, or failed to resolve)
+    """
+    # Local import keeps lifespan bootstrap order flexible (identity
+    # settings read env vars that aren't always set at module import).
+    from app.gateway.identity.propagation import sign_identity_headers as _sign
+    from app.gateway.identity.settings import get_identity_settings as _get_settings
+
+    settings = _get_settings()
+    if not settings.enabled or not settings.internal_signing_key:
+        return
+
+    identity = getattr(request.state, "identity", None)
+    if identity is None or not getattr(identity, "is_authenticated", False):
+        return
+
+    workspace_id = _extract_workspace_id_for_run(request, config)
+    headers = _sign(
+        identity,
+        workspace_id=workspace_id,
+        key=settings.internal_signing_key,
+    )
+
+    configurable = config.setdefault("configurable", {})
+    # Preserve any headers already in place (unlikely but non-destructive)
+    existing = configurable.get("headers")
+    if isinstance(existing, dict):
+        merged = {**existing, **headers}
+    else:
+        merged = headers
+    configurable["headers"] = merged
+
+
+async def _upsert_thread_in_store(
+    store,
+    thread_id: str,
+    metadata: dict | None,
+    *,
+    namespace: tuple[str, ...],
+) -> None:
     """Create or refresh the thread record in the Store.
 
     Called from :func:`start_run` so that threads created via the stateless
@@ -199,7 +283,7 @@ async def _upsert_thread_in_store(store, thread_id: str, metadata: dict | None) 
     from app.gateway.routers.threads import _store_upsert
 
     try:
-        await _store_upsert(store, thread_id, metadata=metadata)
+        await _store_upsert(store, thread_id, metadata=metadata, namespace=namespace)
     except Exception:
         logger.warning("Failed to upsert thread %s in store (non-fatal)", thread_id)
 
@@ -209,6 +293,7 @@ async def _sync_thread_title_after_run(
     thread_id: str,
     checkpointer: Any,
     store: Any,
+    namespace: tuple[str, ...],
 ) -> None:
     """Wait for *run_task* to finish, then persist the generated title to the Store.
 
@@ -240,14 +325,14 @@ async def _sync_thread_title_after_run(
         if not title:
             return
 
-        existing = await _store_get(store, thread_id)
+        existing = await _store_get(store, thread_id, namespace=namespace)
         if existing is None:
             return
 
         updated = dict(existing)
         updated.setdefault("values", {})["title"] = title
         updated["updated_at"] = time.time()
-        await _store_put(store, updated)
+        await _store_put(store, updated, namespace=namespace)
         logger.debug("Synced title %r for thread %s", title, thread_id)
     except Exception:
         logger.debug("Failed to sync title for thread %s (non-fatal)", thread_id, exc_info=True)
@@ -274,6 +359,9 @@ async def start_run(
     run_mgr = get_run_manager(request)
     checkpointer = get_checkpointer(request)
     store = get_store(request)
+    from app.gateway.routers.threads import _thread_scope_namespace
+
+    threads_ns = _thread_scope_namespace(request)
 
     disconnect = DisconnectMode.cancel if body.on_disconnect == "cancel" else DisconnectMode.continue_
 
@@ -295,7 +383,12 @@ async def start_run(
     # were never explicitly created via POST /threads (e.g. stateless runs).
     store = get_store(request)
     if store is not None:
-        await _upsert_thread_in_store(store, thread_id, body.metadata)
+        await _upsert_thread_in_store(
+            store,
+            thread_id,
+            body.metadata,
+            namespace=threads_ns,
+        )
 
     agent_factory = resolve_agent_factory(body.assistant_id)
     graph_input = normalize_input(body.input)
@@ -323,6 +416,15 @@ async def start_run(
             if key in context:
                 configurable.setdefault(key, context[key])
 
+    # M5: inject HMAC-signed identity headers into ``configurable["headers"]``
+    # so the LangGraph-side IdentityMiddleware sees the caller. Safe no-op
+    # when the flag is off, identity is anonymous, or the signing key is
+    # unset. Failures here must not break runs — log and continue.
+    try:
+        _inject_identity_headers(config, request)
+    except Exception:  # pragma: no cover - defensive; tested separately
+        logger.exception("Failed to inject identity headers into run config")
+
     stream_modes = normalize_stream_modes(body.stream_mode)
 
     task = asyncio.create_task(
@@ -347,7 +449,11 @@ async def start_run(
     # the checkpointer into the Store record so that /threads/search returns the
     # correct title instead of an empty values dict.
     if store is not None:
-        asyncio.create_task(_sync_thread_title_after_run(task, thread_id, checkpointer, store))
+        asyncio.create_task(
+            _sync_thread_title_after_run(
+                task, thread_id, checkpointer, store, namespace=threads_ns
+            )
+        )
 
     return record
 

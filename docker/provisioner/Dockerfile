@@ -10,8 +10,23 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     fi
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+# 更换为阿里云镜像源，解决 502 问题
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update --fix-missing \
+    && for i in 1 2 3; do \
+         apt-get install -y --fix-missing --no-install-recommends \
+           curl build-essential gnupg ca-certificates && break || \
+         echo "Retry $i failed, waiting 10 seconds..."; sleep 10; \
+       done \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update --fix-missing \
+    && for i in 1 2 3; do \
+         apt-get install -y nodejs && break || \
+         echo "Retry $i failed, waiting 10 seconds..."; sleep 10; \
+       done \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies

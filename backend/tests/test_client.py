@@ -49,17 +49,6 @@ def client(mock_app_config):
         return DeerFlowClient()
 
 
-@pytest.fixture
-def allow_skill_security_scan():
-    async def _scan(*args, **kwargs):
-        from deerflow.skills.security_scanner import ScanResult
-
-        return ScanResult(decision="allow", reason="ok")
-
-    with patch("deerflow.skills.installer.scan_skill_content", _scan):
-        yield
-
-
 # ---------------------------------------------------------------------------
 # __init__
 # ---------------------------------------------------------------------------
@@ -1206,7 +1195,7 @@ class TestSkillsManagement:
             with pytest.raises(ValueError, match="not found"):
                 client.update_skill("nonexistent", enabled=True)
 
-    def test_install_skill(self, client, allow_skill_security_scan):
+    def test_install_skill(self, client):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
 
@@ -1502,7 +1491,7 @@ class TestArtifacts:
     def test_get_artifact(self, client):
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            outputs = paths.sandbox_outputs_dir("t1")
+            outputs = paths.resolve_sandbox_outputs_dir("t1")
             outputs.mkdir(parents=True)
             (outputs / "result.txt").write_text("artifact content")
 
@@ -1515,7 +1504,7 @@ class TestArtifacts:
     def test_get_artifact_not_found(self, client):
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            paths.sandbox_user_data_dir("t1").mkdir(parents=True)
+            paths.resolve_sandbox_user_data_dir("t1").mkdir(parents=True)
 
             with patch("deerflow.client.get_paths", return_value=paths):
                 with pytest.raises(FileNotFoundError):
@@ -1528,7 +1517,7 @@ class TestArtifacts:
     def test_get_artifact_path_traversal(self, client):
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            paths.sandbox_user_data_dir("t1").mkdir(parents=True)
+            paths.resolve_sandbox_user_data_dir("t1").mkdir(parents=True)
 
             with patch("deerflow.client.get_paths", return_value=paths):
                 with pytest.raises(PathTraversalError):
@@ -1718,7 +1707,7 @@ class TestScenarioFileLifecycle:
             uploads_dir.mkdir()
 
             paths = Paths(base_dir=tmp_path)
-            outputs_dir = paths.sandbox_outputs_dir("t-artifact")
+            outputs_dir = paths.resolve_sandbox_outputs_dir("t-artifact")
             outputs_dir.mkdir(parents=True)
 
             # Upload phase
@@ -1970,9 +1959,9 @@ class TestScenarioThreadIsolation:
         """Artifacts in thread-A are not accessible from thread-B."""
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            outputs_a = paths.sandbox_outputs_dir("thread-a")
+            outputs_a = paths.resolve_sandbox_outputs_dir("thread-a")
             outputs_a.mkdir(parents=True)
-            paths.sandbox_user_data_dir("thread-b").mkdir(parents=True)
+            paths.resolve_sandbox_user_data_dir("thread-b").mkdir(parents=True)
             (outputs_a / "result.txt").write_text("thread-a artifact")
 
             with patch("deerflow.client.get_paths", return_value=paths):
@@ -2026,7 +2015,7 @@ class TestScenarioMemoryWorkflow:
 class TestScenarioSkillInstallAndUse:
     """Scenario: Install a skill → verify it appears → toggle it."""
 
-    def test_install_then_toggle(self, client, allow_skill_security_scan):
+    def test_install_then_toggle(self, client):
         """Install .skill archive → list to verify → disable → verify disabled."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -2272,7 +2261,7 @@ class TestGatewayConformance:
         parsed = SkillResponse(**result)
         assert parsed.name == "web-search"
 
-    def test_install_skill(self, client, tmp_path, allow_skill_security_scan):
+    def test_install_skill(self, client, tmp_path):
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("---\nname: my-skill\ndescription: A test skill\n---\nBody\n")
@@ -2470,7 +2459,7 @@ class TestInstallSkillSecurity:
                 with pytest.raises(ValueError, match="unsafe"):
                     client.install_skill(archive)
 
-    def test_symlinks_skipped_during_extraction(self, client, allow_skill_security_scan):
+    def test_symlinks_skipped_during_extraction(self, client):
         """Symlink entries in the archive are skipped (never written to disk)."""
         import stat as stat_mod
 
@@ -2882,7 +2871,7 @@ class TestArtifactHardening:
         """get_artifact rejects paths that resolve to a directory."""
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            subdir = paths.sandbox_outputs_dir("t1") / "subdir"
+            subdir = paths.resolve_sandbox_outputs_dir("t1") / "subdir"
             subdir.mkdir(parents=True)
 
             with patch("deerflow.client.get_paths", return_value=paths):
@@ -2893,7 +2882,7 @@ class TestArtifactHardening:
         """Paths with leading slash are handled correctly."""
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            outputs = paths.sandbox_outputs_dir("t1")
+            outputs = paths.resolve_sandbox_outputs_dir("t1")
             outputs.mkdir(parents=True)
             (outputs / "file.txt").write_text("content")
 
@@ -3009,7 +2998,7 @@ class TestBugArtifactPrefixMatchTooLoose:
         """Bare 'mnt/user-data' is accepted (will later fail as directory, not at prefix)."""
         with tempfile.TemporaryDirectory() as tmp:
             paths = Paths(base_dir=tmp)
-            paths.sandbox_user_data_dir("t1").mkdir(parents=True)
+            paths.resolve_sandbox_user_data_dir("t1").mkdir(parents=True)
 
             with patch("deerflow.client.get_paths", return_value=paths):
                 # Accepted at prefix check, but fails because it's a directory.
@@ -3029,7 +3018,11 @@ class TestBugListUploadsDeadCode:
             assert not non_existent.exists()
 
             mock_paths = MagicMock()
-            mock_paths.sandbox_uploads_dir.return_value = non_existent
+            # M4 task 7: manager now uses ``resolve_sandbox_uploads_dir`` so it
+            # can thread tenant/workspace ids through when the caller supplies
+            # them. Both names are mocked for belt-and-braces coverage.
+            mock_paths.resolve_sandbox_uploads_dir.return_value = non_existent
+            mock_paths.resolve_sandbox_uploads_dir.return_value = non_existent
 
             with patch("deerflow.uploads.manager.get_paths", return_value=mock_paths):
                 result = client.list_uploads("thread-fresh")

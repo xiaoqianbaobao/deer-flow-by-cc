@@ -246,12 +246,24 @@ class AioSandboxProvider(SandboxProvider):
 
     # ── Mount helpers ────────────────────────────────────────────────────
 
-    def _get_extra_mounts(self, thread_id: str | None) -> list[tuple[str, str, bool]]:
-        """Collect all extra mounts for a sandbox (thread-specific + skills)."""
+    def _get_extra_mounts(
+        self,
+        thread_id: str | None,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> list[tuple[str, str, bool]]:
+        """Collect all extra mounts for a sandbox (thread-specific + skills).
+
+        The bind-mount *destination* is always the legacy virtual prefix
+        (``/mnt/user-data/...``) — sandboxed agents never see tenant ids in
+        their filesystem view. Only the host-side *source* path is stratified
+        when ``tenant_id`` / ``workspace_id`` are supplied.
+        """
         mounts: list[tuple[str, str, bool]] = []
 
         if thread_id:
-            mounts.extend(self._get_thread_mounts(thread_id))
+            mounts.extend(self._get_thread_mounts(thread_id, tenant_id=tenant_id, workspace_id=workspace_id))
             logger.info(f"Adding thread mounts for thread {thread_id}: {mounts}")
 
         skills_mount = self._get_skills_mount()
@@ -262,23 +274,51 @@ class AioSandboxProvider(SandboxProvider):
         return mounts
 
     @staticmethod
-    def _get_thread_mounts(thread_id: str) -> list[tuple[str, str, bool]]:
+    def _get_thread_mounts(
+        thread_id: str,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> list[tuple[str, str, bool]]:
         """Get volume mounts for a thread's data directories.
 
         Creates directories if they don't exist (lazy initialization).
         Mount sources use host_base_dir so that when running inside Docker with a
         mounted Docker socket (DooD), the host Docker daemon can resolve the paths.
+
+        When both ``tenant_id`` and ``workspace_id`` are supplied, the host
+        source paths are stratified under
+        ``tenants/{tenant_id}/workspaces/{workspace_id}/threads/{thread_id}/``.
+        Otherwise the legacy ``threads/{thread_id}/`` layout is used verbatim.
+        The container-side destination is always the legacy virtual prefix —
+        the sandbox must never see a tenant id in its mount-point name.
         """
         paths = get_paths()
-        paths.ensure_thread_dirs(thread_id)
+        paths.ensure_thread_dirs_for(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
 
         return [
-            (paths.host_sandbox_work_dir(thread_id), f"{VIRTUAL_PATH_PREFIX}/workspace", False),
-            (paths.host_sandbox_uploads_dir(thread_id), f"{VIRTUAL_PATH_PREFIX}/uploads", False),
-            (paths.host_sandbox_outputs_dir(thread_id), f"{VIRTUAL_PATH_PREFIX}/outputs", False),
+            (
+                paths.resolve_host_sandbox_work_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id),
+                f"{VIRTUAL_PATH_PREFIX}/workspace",
+                False,
+            ),
+            (
+                paths.resolve_host_sandbox_uploads_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id),
+                f"{VIRTUAL_PATH_PREFIX}/uploads",
+                False,
+            ),
+            (
+                paths.resolve_host_sandbox_outputs_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id),
+                f"{VIRTUAL_PATH_PREFIX}/outputs",
+                False,
+            ),
             # ACP workspace: read-only inside the sandbox (lead agent reads results;
             # the ACP subprocess writes from the host side, not from within the container).
-            (paths.host_acp_workspace_dir(thread_id), "/mnt/acp-workspace", True),
+            (
+                paths.resolve_host_acp_workspace_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id),
+                "/mnt/acp-workspace",
+                True,
+            ),
         ]
 
     @staticmethod
@@ -416,7 +456,13 @@ class AioSandboxProvider(SandboxProvider):
 
     # ── Core: acquire / get / release / shutdown ─────────────────────────
 
-    def acquire(self, thread_id: str | None = None) -> str:
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
         """Acquire a sandbox environment and return its ID.
 
         For the same thread_id, this method will return the same sandbox_id
@@ -427,6 +473,10 @@ class AioSandboxProvider(SandboxProvider):
 
         Args:
             thread_id: Optional thread ID for thread-specific configurations.
+            tenant_id: Optional tenant ID. When combined with ``workspace_id``,
+                sandbox bind-mount sources are routed under
+                ``tenants/{tenant_id}/workspaces/{workspace_id}/threads/...``.
+            workspace_id: Optional workspace ID (see ``tenant_id``).
 
         Returns:
             The ID of the acquired sandbox environment.
@@ -434,11 +484,17 @@ class AioSandboxProvider(SandboxProvider):
         if thread_id:
             thread_lock = self._get_thread_lock(thread_id)
             with thread_lock:
-                return self._acquire_internal(thread_id)
+                return self._acquire_internal(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
         else:
-            return self._acquire_internal(thread_id)
+            return self._acquire_internal(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
 
-    def _acquire_internal(self, thread_id: str | None) -> str:
+    def _acquire_internal(
+        self,
+        thread_id: str | None,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
         """Internal sandbox acquisition with two-layer consistency.
 
         Layer 1: In-process cache (fastest, covers same-process repeated access)
@@ -479,19 +535,31 @@ class AioSandboxProvider(SandboxProvider):
         # for the same thread_id serialize here: the second process will discover
         # the container started by the first instead of hitting a name-conflict.
         if thread_id:
-            return self._discover_or_create_with_lock(thread_id, sandbox_id)
+            return self._discover_or_create_with_lock(thread_id, sandbox_id, tenant_id=tenant_id, workspace_id=workspace_id)
 
-        return self._create_sandbox(thread_id, sandbox_id)
+        return self._create_sandbox(thread_id, sandbox_id, tenant_id=tenant_id, workspace_id=workspace_id)
 
-    def _discover_or_create_with_lock(self, thread_id: str, sandbox_id: str) -> str:
+    def _discover_or_create_with_lock(
+        self,
+        thread_id: str,
+        sandbox_id: str,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
         """Discover an existing sandbox or create a new one under a cross-process file lock.
 
         The file lock serializes concurrent sandbox creation for the same thread_id
         across multiple processes, preventing container-name conflicts.
+
+        When ``tenant_id`` + ``workspace_id`` are supplied the lock file is also
+        placed under the tenant-stratified thread directory — otherwise the
+        legacy flat thread directory is used so lock behaviour is unchanged
+        for flag-off callers.
         """
         paths = get_paths()
-        paths.ensure_thread_dirs(thread_id)
-        lock_path = paths.thread_dir(thread_id) / f"{sandbox_id}.lock"
+        paths.ensure_thread_dirs_for(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
+        lock_path = paths.resolve_thread_dir(thread_id, tenant_id=tenant_id, workspace_id=workspace_id) / f"{sandbox_id}.lock"
 
         with open(lock_path, "a", encoding="utf-8") as lock_file:
             locked = False
@@ -529,7 +597,7 @@ class AioSandboxProvider(SandboxProvider):
                     logger.info(f"Discovered existing sandbox {discovered.sandbox_id} for thread {thread_id} at {discovered.sandbox_url}")
                     return discovered.sandbox_id
 
-                return self._create_sandbox(thread_id, sandbox_id)
+                return self._create_sandbox(thread_id, sandbox_id, tenant_id=tenant_id, workspace_id=workspace_id)
             finally:
                 if locked:
                     _unlock_file(lock_file)
@@ -554,12 +622,21 @@ class AioSandboxProvider(SandboxProvider):
             return None
         return oldest_id
 
-    def _create_sandbox(self, thread_id: str | None, sandbox_id: str) -> str:
+    def _create_sandbox(
+        self,
+        thread_id: str | None,
+        sandbox_id: str,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
         """Create a new sandbox via the backend.
 
         Args:
             thread_id: Optional thread ID.
             sandbox_id: The sandbox ID to use.
+            tenant_id: Optional tenant ID for stratified bind-mount sources.
+            workspace_id: Optional workspace ID (pair with ``tenant_id``).
 
         Returns:
             The sandbox_id.
@@ -567,7 +644,7 @@ class AioSandboxProvider(SandboxProvider):
         Raises:
             RuntimeError: If sandbox creation or readiness check fails.
         """
-        extra_mounts = self._get_extra_mounts(thread_id)
+        extra_mounts = self._get_extra_mounts(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
 
         # Enforce replicas: only warm-pool containers count toward eviction budget.
         # Active sandboxes are in use by live threads and must not be forcibly stopped.

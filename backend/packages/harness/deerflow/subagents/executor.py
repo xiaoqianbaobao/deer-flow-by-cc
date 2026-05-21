@@ -1,6 +1,7 @@
 """Subagent execution engine."""
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import uuid
@@ -18,6 +19,7 @@ from langchain_core.runnables import RunnableConfig
 
 from deerflow.agents.thread_state import SandboxState, ThreadDataState, ThreadState
 from deerflow.models import create_chat_model
+from deerflow.runtime.main_loop import has_main_loop, submit_to_main_loop
 from deerflow.subagents.config import SubagentConfig
 
 logger = logging.getLogger(__name__)
@@ -76,10 +78,6 @@ _scheduler_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent
 # Larger pool to avoid blocking when scheduler submits execution tasks
 _execution_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-exec-")
 
-# Dedicated pool for sync execute() calls made from an already-running event loop.
-_isolated_loop_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="subagent-isolated-")
-
-
 def _filter_tools(
     all_tools: list[BaseTool],
     allowed: list[str] | None,
@@ -137,6 +135,7 @@ class SubagentExecutor:
         thread_data: ThreadDataState | None = None,
         thread_id: str | None = None,
         trace_id: str | None = None,
+        identity: Any = None,
     ):
         """Initialize the executor.
 
@@ -148,12 +147,18 @@ class SubagentExecutor:
             thread_data: Thread data from parent agent.
             thread_id: Thread ID for sandbox operations.
             trace_id: Trace ID from parent for distributed tracing.
+            identity: Parent agent's identity (M5). Passed through into
+                the subagent's initial state so its guardrail middleware
+                sees the same user / tenant / permissions. Opaque ``Any``
+                because the harness must not import the Gateway
+                :class:`Identity` dataclass.
         """
         self.config = config
         self.parent_model = parent_model
         self.sandbox_state = sandbox_state
         self.thread_data = thread_data
         self.thread_id = thread_id
+        self.identity = identity
         # Generate trace_id if not provided (for top-level calls)
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
 
@@ -267,6 +272,13 @@ class SubagentExecutor:
             state["sandbox"] = self.sandbox_state
         if self.thread_data is not None:
             state["thread_data"] = self.thread_data
+        # M5: carry parent identity into subagent state so the subagent's
+        # IdentityGuardrailMiddleware sees it directly — no HMAC
+        # round-trip needed for intra-process delegation. The subagent's
+        # IdentityMiddleware detects the pre-populated state and does not
+        # overwrite it.
+        if self.identity is not None:
+            state["identity"] = self.identity
 
         return state
 
@@ -442,54 +454,12 @@ class SubagentExecutor:
 
         return result
 
-    def _execute_in_isolated_loop(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
-        """Execute the subagent in a completely fresh event loop.
-
-        This method is designed to run in a separate thread to ensure complete
-        isolation from any parent event loop, preventing conflicts with asyncio
-        primitives that may be bound to the parent loop (e.g., httpx clients).
-        """
-        try:
-            previous_loop = asyncio.get_event_loop()
-        except RuntimeError:
-            previous_loop = None
-
-        # Create and set a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(self._aexecute(task, result_holder))
-        finally:
-            try:
-                pending = asyncio.all_tasks(loop)
-                if pending:
-                    for task_obj in pending:
-                        task_obj.cancel()
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(loop.shutdown_default_executor())
-            except Exception:
-                logger.debug(
-                    f"[trace={self.trace_id}] Failed while cleaning up isolated event loop for subagent {self.config.name}",
-                    exc_info=True,
-                )
-            finally:
-                try:
-                    loop.close()
-                finally:
-                    asyncio.set_event_loop(previous_loop)
-
     def execute(self, task: str, result_holder: SubagentResult | None = None) -> SubagentResult:
-        """Execute a task synchronously (wrapper around async execution).
+        """Execute a task synchronously.
 
-        This method runs the async execution in a new event loop, allowing
-        asynchronous tools (like MCP tools) to be used within the thread pool.
-
-        When called from within an already-running event loop (e.g., when the
-        parent agent is async), this method isolates the subagent execution in
-        a separate thread to avoid event loop conflicts with shared async
-        primitives like httpx clients.
+        When the Gateway has registered a main loop (see deerflow.runtime.main_loop),
+        the subagent's async _aexecute runs on that long-lived loop. Otherwise we
+        fall back to a fresh ephemeral loop via asyncio.run (Standard mode).
 
         Args:
             task: The task description for the subagent.
@@ -498,34 +468,42 @@ class SubagentExecutor:
         Returns:
             SubagentResult with the execution result.
         """
-        try:
+
+        def _build_failed(message: str) -> SubagentResult:
+            res = result_holder or SubagentResult(
+                task_id=str(uuid.uuid4())[:8],
+                trace_id=self.trace_id,
+                status=SubagentStatus.FAILED,
+            )
+            res.status = SubagentStatus.FAILED
+            res.error = message
+            res.completed_at = datetime.now()
+            return res
+
+        if has_main_loop():
             try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+                return submit_to_main_loop(
+                    lambda: self._aexecute(task, result_holder)
+                )
+            except concurrent.futures.CancelledError:
+                logger.info(
+                    f"[trace={self.trace_id}] Subagent {self.config.name} cancelled during shutdown"
+                )
+                return _build_failed("Cancelled during shutdown")
+            except Exception as e:
+                logger.exception(
+                    f"[trace={self.trace_id}] Subagent {self.config.name} execution failed via main loop"
+                )
+                return _build_failed(str(e))
 
-            if loop is not None and loop.is_running():
-                logger.debug(f"[trace={self.trace_id}] Subagent {self.config.name} detected running event loop, using isolated thread")
-                future = _isolated_loop_pool.submit(self._execute_in_isolated_loop, task, result_holder)
-                return future.result()
-
-            # Standard path: no running event loop, use asyncio.run
+        # Fallback: no main loop registered (Standard mode / tests).
+        try:
             return asyncio.run(self._aexecute(task, result_holder))
         except Exception as e:
-            logger.exception(f"[trace={self.trace_id}] Subagent {self.config.name} execution failed")
-            # Create a result with error if we don't have one
-            if result_holder is not None:
-                result = result_holder
-            else:
-                result = SubagentResult(
-                    task_id=str(uuid.uuid4())[:8],
-                    trace_id=self.trace_id,
-                    status=SubagentStatus.FAILED,
-                )
-            result.status = SubagentStatus.FAILED
-            result.error = str(e)
-            result.completed_at = datetime.now()
-            return result
+            logger.exception(
+                f"[trace={self.trace_id}] Subagent {self.config.name} execution failed (fallback path)"
+            )
+            return _build_failed(str(e))
 
     def execute_async(self, task: str, task_id: str | None = None) -> str:
         """Start a task execution in the background.

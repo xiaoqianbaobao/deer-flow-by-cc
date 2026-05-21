@@ -1,14 +1,14 @@
 "use client";
 
 import {
-  BugIcon,
   ChevronsUpDown,
-  GlobeIcon,
   InfoIcon,
-  MailIcon,
+  LayoutDashboardIcon,
+  LogOutIcon,
   Settings2Icon,
   SettingsIcon,
 } from "lucide-react";
+import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import {
@@ -26,8 +26,8 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useI18n } from "@/core/i18n/hooks";
+import { useIdentity } from "@/core/identity/hooks";
 
-import { GithubIcon } from "./github-icon";
 import { SettingsDialog } from "./settings";
 
 function NavMenuButtonContent({
@@ -50,6 +50,11 @@ function NavMenuButtonContent({
   );
 }
 
+async function logout() {
+  await fetch("/api/auth/logout", { method: "POST" }).catch(() => null);
+  window.location.href = "/login";
+}
+
 export function WorkspaceNavMenu() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDefaultSection, setSettingsDefaultSection] = useState<
@@ -58,6 +63,13 @@ export function WorkspaceNavMenu() {
   const [mounted, setMounted] = useState(false);
   const { open: isSidebarOpen } = useSidebar();
   const { t } = useI18n();
+  const { identity } = useIdentity();
+
+  const isPlatformAdmin =
+    identity?.roles?.platform?.includes("platform_admin") === true;
+  const isTenantOwner =
+    identity?.roles?.tenant?.includes("tenant_owner") === true;
+  const isAdmin = isPlatformAdmin || isTenantOwner;
 
   useEffect(() => {
     setMounted(true);
@@ -97,44 +109,18 @@ export function WorkspaceNavMenu() {
                     <Settings2Icon />
                     {t.common.settings}
                   </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <a
-                    href="https://deerflow.tech/"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <DropdownMenuItem>
-                      <GlobeIcon />
-                      {t.workspace.officialWebsite}
-                    </DropdownMenuItem>
-                  </a>
-                  <a
-                    href="https://github.com/bytedance/deer-flow"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <DropdownMenuItem>
-                      <GithubIcon />
-                      {t.workspace.visitGithub}
-                    </DropdownMenuItem>
-                  </a>
-                  <DropdownMenuSeparator />
-                  <a
-                    href="https://github.com/bytedance/deer-flow/issues"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <DropdownMenuItem>
-                      <BugIcon />
-                      {t.workspace.reportIssue}
-                    </DropdownMenuItem>
-                  </a>
-                  <a href="mailto:support@deerflow.tech">
-                    <DropdownMenuItem>
-                      <MailIcon />
-                      {t.workspace.contactUs}
-                    </DropdownMenuItem>
-                  </a>
+
+                  {isAdmin && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <Link href="/admin/tenants">
+                        <DropdownMenuItem>
+                          <LayoutDashboardIcon />
+                          系统管理
+                        </DropdownMenuItem>
+                      </Link>
+                    </>
+                  )}
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -146,6 +132,24 @@ export function WorkspaceNavMenu() {
                   <InfoIcon />
                   {t.workspace.about}
                 </DropdownMenuItem>
+
+                {identity && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={logout}
+                      className="text-destructive focus:text-destructive"
+                    >
+                      <LogOutIcon />
+                      Sign out
+                      {identity.email ? (
+                        <span className="text-muted-foreground ml-auto max-w-28 truncate text-xs">
+                          {identity.email}
+                        </span>
+                      ) : null}
+                    </DropdownMenuItem>
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           ) : (

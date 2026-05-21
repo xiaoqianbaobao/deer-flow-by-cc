@@ -39,7 +39,7 @@ def test_present_files_keeps_virtual_outputs_path(tmp_path, monkeypatch):
     monkeypatch.setattr(
         present_file_tool_module,
         "get_paths",
-        lambda: SimpleNamespace(resolve_virtual_path=lambda thread_id, path: artifact_path),
+        lambda: SimpleNamespace(resolve_virtual_path=lambda thread_id, path, *, tenant_id=None, workspace_id=None: artifact_path),
     )
 
     result = present_file_tool_module.present_file_tool.func(
@@ -60,7 +60,7 @@ def test_present_files_uses_config_thread_id_when_context_missing(tmp_path, monk
     monkeypatch.setattr(
         present_file_tool_module,
         "get_paths",
-        lambda: SimpleNamespace(resolve_virtual_path=lambda thread_id, path: artifact_path),
+        lambda: SimpleNamespace(resolve_virtual_path=lambda thread_id, path, *, tenant_id=None, workspace_id=None: artifact_path),
     )
 
     runtime = SimpleNamespace(

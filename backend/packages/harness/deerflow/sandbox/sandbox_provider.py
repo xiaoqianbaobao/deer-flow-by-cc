@@ -11,8 +11,27 @@ class SandboxProvider(ABC):
     uses_thread_data_mounts: bool = False
 
     @abstractmethod
-    def acquire(self, thread_id: str | None = None) -> str:
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
         """Acquire a sandbox environment and return its ID.
+
+        Args:
+            thread_id: Optional LangGraph thread ID. Required for thread-specific
+                host-side path stratification.
+            tenant_id: Optional tenant ID (M4 storage isolation). When combined
+                with ``workspace_id`` it routes the sandbox's host-side bind
+                mounts / work directories under
+                ``tenants/{tenant_id}/workspaces/{workspace_id}/threads/...``.
+                ``None`` (or any non-positive value) preserves the legacy
+                single-tenant layout for flag-off callers.
+            workspace_id: Optional workspace ID (M4 storage isolation). Must be
+                supplied together with ``tenant_id`` — a tenant id alone is
+                insufficient for stratification and also falls back to legacy.
 
         Returns:
             The ID of the acquired sandbox environment.

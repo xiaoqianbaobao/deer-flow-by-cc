@@ -30,7 +30,6 @@ import {
 } from "@/core/messages/utils";
 import { useRehypeSplitWordsIntoSpans } from "@/core/rehype";
 import { extractTitleFromMarkdown } from "@/core/utils/markdown";
-import { env } from "@/env";
 import { cn } from "@/lib/utils";
 
 import { useArtifacts } from "../artifacts";
@@ -49,12 +48,8 @@ export function MessageGroup({
   isLoading?: boolean;
 }) {
   const { t } = useI18n();
-  const [showAbove, setShowAbove] = useState(
-    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true",
-  );
-  const [showLastThinking, setShowLastThinking] = useState(
-    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true",
-  );
+  const [showAbove, setShowAbove] = useState(true);
+  const [showLastThinking, setShowLastThinking] = useState(true);
   const steps = useMemo(() => convertToSteps(messages), [messages]);
   const lastToolCallStep = useMemo(() => {
     const filteredSteps = steps.filter((step) => step.type === "toolCall");
@@ -336,11 +331,21 @@ function ToolCall({
       description = t.toolCalls.writeFile;
     }
     const path: string | undefined = (args as { path: string })?.path;
+    // write_file embeds full file content in tool_call args, so the artifact
+    // viewer can render it from the message itself (works while streaming,
+    // before the file has even been flushed to disk). str_replace only carries
+    // old_str/new_str — the post-edit file lives on disk, so the viewer must
+    // fetch it. Distinguish by URL scheme: write-file: → in-message render,
+    // plain path → HTTP fetch (and our message-watcher invalidates the cache).
+    const buildUrl = (): string =>
+      name === "write_file"
+        ? new URL(
+            `write-file:${path}?message_id=${messageId}&tool_call_id=${id}`,
+          ).toString()
+        : path ?? "";
     if (isLoading && isLast && autoOpen && autoSelect && path && !result) {
       setTimeout(() => {
-        const url = new URL(
-          `write-file:${path}?message_id=${messageId}&tool_call_id=${id}`,
-        ).toString();
+        const url = buildUrl();
         if (selectedArtifact === url) {
           return;
         }
@@ -356,11 +361,8 @@ function ToolCall({
         label={description}
         icon={NotebookPenIcon}
         onClick={() => {
-          select(
-            new URL(
-              `write-file:${path}?message_id=${messageId}&tool_call_id=${id}`,
-            ).toString(),
-          );
+          if (!path) return;
+          select(buildUrl());
           setOpen(true);
         }}
       >

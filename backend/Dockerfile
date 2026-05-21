@@ -14,24 +14,36 @@ ARG NODE_MAJOR=22
 ARG APT_MIRROR
 ARG UV_INDEX_URL
 
-# Optionally override apt mirror for restricted networks (e.g. APT_MIRROR=mirrors.aliyun.com)
-RUN if [ -n "${APT_MIRROR}" ]; then \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
-      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
-    fi
-
 # Install build tools + Node.js (build-essential needed for native Python extensions)
-RUN apt-get update && apt-get install -y \
-    curl \
-    build-essential \
-    gnupg \
-    ca-certificates \
-    && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# Network to Debian mirrors can be flaky, so keep mirror override optional and
+# add retries instead of hard-coding a single vendor mirror.
+RUN set -eux; \
+    if [ -n "${APT_MIRROR}" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi; \
+    retry() { \
+      n=0; \
+      until "$@"; do \
+        n=$((n + 1)); \
+        if [ "$n" -ge 5 ]; then \
+          return 1; \
+        fi; \
+        sleep $((n * 5)); \
+      done; \
+    }; \
+    retry apt-get update -o Acquire::Retries=5; \
+    retry apt-get install -y --no-install-recommends --fix-missing -o Acquire::Retries=5 \
+      curl \
+      build-essential \
+      gnupg \
+      ca-certificates; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list; \
+    retry apt-get update -o Acquire::Retries=5; \
+    retry apt-get install -y --no-install-recommends --fix-missing -o Acquire::Retries=5 nodejs; \
+    rm -rf /var/lib/apt/lists/*
 
 # Install uv (source image overridable via UV_IMAGE build arg)
 COPY --from=uv-source /uv /uvx /usr/local/bin/

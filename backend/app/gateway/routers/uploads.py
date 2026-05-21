@@ -3,10 +3,13 @@
 import logging
 import os
 import stat
+from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
+from app.gateway.identity.request_scope import extract_scope
+from app.gateway.identity.storage.path_guard import PathEscapeError, assert_within_tenant_root
 from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import get_paths
 from deerflow.sandbox.sandbox_provider import SandboxProvider, get_sandbox_provider
@@ -26,6 +29,33 @@ from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/threads/{thread_id}/uploads", tags=["uploads"])
+
+
+def _extract_scope(request: Request | None) -> tuple[int | None, int | None]:
+    """Backward-compat alias retained for in-file callers; delegates to the
+    shared :func:`app.gateway.identity.request_scope.extract_scope`."""
+    return extract_scope(request)
+
+
+def _guard_uploads_dir(uploads_dir: Path, thread_id: str, tid: int | None) -> None:
+    """If a tenant scope is in effect, assert the resolved dir is under tenant root.
+
+    When ``tid`` is ``None`` the caller is in legacy (flag-off / anonymous)
+    mode and no tenant-root check is possible — path_guard only knows how to
+    validate against ``tenants/{tid}/...`` roots.
+    """
+    if tid is None:
+        return
+    try:
+        assert_within_tenant_root(uploads_dir, tid)
+    except PathEscapeError as exc:
+        logger.warning(
+            "authz.path.denied thread=%s tenant=%s reason=%s",
+            thread_id,
+            tid,
+            exc,
+        )
+        raise HTTPException(status_code=403, detail="Access denied") from None
 
 
 class UploadResponse(BaseModel):
@@ -85,17 +115,21 @@ def _auto_convert_documents_enabled() -> bool:
 @router.post("", response_model=UploadResponse)
 async def upload_files(
     thread_id: str,
+    request: Request,
     files: list[UploadFile] = File(...),
 ) -> UploadResponse:
     """Upload multiple files to a thread's uploads directory."""
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
 
+    tid, wid = _extract_scope(request)
+
     try:
-        uploads_dir = ensure_uploads_dir(thread_id)
+        uploads_dir = ensure_uploads_dir(thread_id, tenant_id=tid, workspace_id=wid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    sandbox_uploads = get_paths().sandbox_uploads_dir(thread_id)
+    _guard_uploads_dir(uploads_dir, thread_id, tid)
+    sandbox_uploads = get_paths().resolve_sandbox_uploads_dir(thread_id, tenant_id=tid, workspace_id=wid)
     uploaded_files = []
 
     sandbox_provider = get_sandbox_provider()
@@ -166,17 +200,20 @@ async def upload_files(
 
 
 @router.get("/list", response_model=dict)
-async def list_uploaded_files(thread_id: str) -> dict:
+async def list_uploaded_files(thread_id: str, request: Request) -> dict:
     """List all files in a thread's uploads directory."""
+    tid, wid = _extract_scope(request)
+
     try:
-        uploads_dir = get_uploads_dir(thread_id)
+        uploads_dir = get_uploads_dir(thread_id, tenant_id=tid, workspace_id=wid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _guard_uploads_dir(uploads_dir, thread_id, tid)
     result = list_files_in_dir(uploads_dir)
     enrich_file_listing(result, thread_id)
 
     # Gateway additionally includes the sandbox-relative path.
-    sandbox_uploads = get_paths().sandbox_uploads_dir(thread_id)
+    sandbox_uploads = get_paths().resolve_sandbox_uploads_dir(thread_id, tenant_id=tid, workspace_id=wid)
     for f in result["files"]:
         f["path"] = str(sandbox_uploads / f["filename"])
 
@@ -184,12 +221,37 @@ async def list_uploaded_files(thread_id: str) -> dict:
 
 
 @router.delete("/{filename}")
-async def delete_uploaded_file(thread_id: str, filename: str) -> dict:
+async def delete_uploaded_file(thread_id: str, filename: str, request: Request) -> dict:
     """Delete a file from a thread's uploads directory."""
+    tid, wid = _extract_scope(request)
+
     try:
-        uploads_dir = get_uploads_dir(thread_id)
+        uploads_dir = get_uploads_dir(thread_id, tenant_id=tid, workspace_id=wid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _guard_uploads_dir(uploads_dir, thread_id, tid)
+    # Defence-in-depth: when a tenant scope is active, validate the *resolved*
+    # target file stays under the tenant root *before* performing the delete.
+    # ``delete_file_safe`` already enforces containment inside ``uploads_dir``,
+    # and ``_guard_uploads_dir`` verifies ``uploads_dir`` itself is under the
+    # tenant root — this extra check catches any exotic case where the
+    # normalised filename introduces a symlink hop that leaves the tenant
+    # subtree.
+    if tid is not None:
+        try:
+            safe_name = normalize_filename(filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        try:
+            assert_within_tenant_root(uploads_dir / safe_name, tid)
+        except PathEscapeError as exc:
+            logger.warning(
+                "authz.path.denied thread=%s tenant=%s reason=%s",
+                thread_id,
+                tid,
+                exc,
+            )
+            raise HTTPException(status_code=403, detail="Access denied") from None
     try:
         return delete_file_safe(uploads_dir, filename, convertible_extensions=CONVERTIBLE_EXTENSIONS)
     except FileNotFoundError:

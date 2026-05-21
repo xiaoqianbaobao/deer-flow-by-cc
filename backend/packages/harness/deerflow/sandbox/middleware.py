@@ -1,10 +1,11 @@
 import logging
-from typing import NotRequired, override
+from typing import Any, NotRequired, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langgraph.runtime import Runtime
 
+from deerflow.agents.middlewares._identity import extract_tenant_ids
 from deerflow.agents.thread_state import SandboxState, ThreadDataState
 from deerflow.sandbox import get_sandbox_provider
 
@@ -12,10 +13,19 @@ logger = logging.getLogger(__name__)
 
 
 class SandboxMiddlewareState(AgentState):
-    """Compatible with the `ThreadState` schema."""
+    """Compatible with the `ThreadState` schema.
+
+    ``identity`` is opaque (typed as ``Any``) to preserve the harness boundary
+    — see ``ThreadDataMiddlewareState`` for the same pattern. When present,
+    the middleware extracts ``tenant_id`` / ``workspace_id`` and forwards them
+    to the sandbox provider so that bind-mount sources (for Docker sandboxes)
+    and host directory allocation (for the local sandbox) are routed under
+    the tenant-stratified layout.
+    """
 
     sandbox: NotRequired[SandboxState | None]
     thread_data: NotRequired[ThreadDataState | None]
+    identity: NotRequired[Any]
 
 
 class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
@@ -42,9 +52,15 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
         super().__init__()
         self._lazy_init = lazy_init
 
-    def _acquire_sandbox(self, thread_id: str) -> str:
+    def _acquire_sandbox(
+        self,
+        thread_id: str,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
         provider = get_sandbox_provider()
-        sandbox_id = provider.acquire(thread_id)
+        sandbox_id = provider.acquire(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
         logger.info(f"Acquiring sandbox {sandbox_id}")
         return sandbox_id
 
@@ -59,7 +75,14 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             thread_id = (runtime.context or {}).get("thread_id")
             if thread_id is None:
                 return super().before_agent(state, runtime)
-            sandbox_id = self._acquire_sandbox(thread_id)
+
+            # Identity is opaque (may be a dict, dataclass, or None) — read
+            # defensively so flag-off callers that never populate state["identity"]
+            # continue to get the legacy single-tenant layout.
+            identity = state.get("identity") if hasattr(state, "get") else None
+            tenant_id, workspace_id = extract_tenant_ids(identity)
+
+            sandbox_id = self._acquire_sandbox(thread_id, tenant_id=tenant_id, workspace_id=workspace_id)
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
             return {"sandbox": {"sandbox_id": sandbox_id}}
         return super().before_agent(state, runtime)

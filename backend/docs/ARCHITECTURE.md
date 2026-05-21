@@ -188,6 +188,8 @@ class ThreadState(AgentState):
 | `/mnt/user-data/outputs` | `backend/.deer-flow/threads/{thread_id}/user-data/outputs` |
 | `/mnt/skills` | `deer-flow/skills/` |
 
+> **Identity mode (M4, `ENABLE_IDENTITY=true`)**: physical paths become tenant-stratified under `$DEER_FLOW_HOME/tenants/{tid}/workspaces/{wid}/threads/{thread_id}/user-data/...` (and `.../acp-workspace/`). Virtual paths shown to the agent are unchanged. See [../CLAUDE.md#identity-subsystem-appgatewayidentity](../CLAUDE.md) → "Storage (M4)" for the full layout and guard rails.
+
 ### Tool System
 
 ```

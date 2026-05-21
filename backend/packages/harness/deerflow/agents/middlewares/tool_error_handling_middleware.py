@@ -72,19 +72,45 @@ def _build_runtime_middlewares(
     lazy_init: bool = True,
 ) -> list[AgentMiddleware]:
     """Build shared base middlewares for agent execution."""
+    import os
+
     from deerflow.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
     from deerflow.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
     from deerflow.sandbox.middleware import SandboxMiddleware
 
-    middlewares: list[AgentMiddleware] = [
-        ThreadDataMiddleware(lazy_init=lazy_init),
-        SandboxMiddleware(lazy_init=lazy_init),
-    ]
+    middlewares: list[AgentMiddleware] = []
+
+    # IdentityMiddleware (M5) sits at position 0 so every downstream stage
+    # sees ``state["identity"]`` already populated. We only register it when
+    # a signing key is configured — otherwise we're in legacy / flag-off
+    # mode and there is nothing to verify.
+    signing_key = os.environ.get("DEERFLOW_INTERNAL_SIGNING_KEY") or ""
+    if signing_key:
+        from deerflow.agents.middlewares.identity_middleware import IdentityMiddleware
+
+        skew_raw = os.environ.get("DEERFLOW_HMAC_SKEW_SEC", "")
+        try:
+            skew_sec = int(skew_raw) if skew_raw else 300
+        except ValueError:
+            skew_sec = 300
+        middlewares.append(IdentityMiddleware(signing_key=signing_key, skew_sec=skew_sec))
+
+    middlewares.extend(
+        [
+            ThreadDataMiddleware(lazy_init=lazy_init),
+            SandboxMiddleware(lazy_init=lazy_init),
+        ]
+    )
 
     if include_uploads:
+        from deerflow.agents.middlewares.thread_data_middleware import ThreadDataMiddleware as _TDM
         from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
 
-        middlewares.insert(1, UploadsMiddleware())
+        # Insert immediately after ThreadDataMiddleware so UploadsMiddleware
+        # can see the thread paths it populated. The absolute index depends
+        # on whether IdentityMiddleware registered ahead of it.
+        tdm_index = next((i for i, mw in enumerate(middlewares) if isinstance(mw, _TDM)), 0)
+        middlewares.insert(tdm_index + 1, UploadsMiddleware())
 
     if include_dangling_tool_call_patch:
         from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
@@ -92,6 +118,15 @@ def _build_runtime_middlewares(
         middlewares.append(DanglingToolCallMiddleware())
 
     middlewares.append(LLMErrorHandlingMiddleware())
+
+    # Identity-driven permission gate (M5). Runs *before* any configured
+    # OAP/allowlist provider so both gates compose. Tied to the same
+    # DEERFLOW_INTERNAL_SIGNING_KEY switch as IdentityMiddleware — no key,
+    # no identity in state, no gate (matches pre-M5 behavior).
+    if signing_key:
+        from deerflow.guardrails.identity_guardrail import IdentityGuardrailMiddleware
+
+        middlewares.append(IdentityGuardrailMiddleware())
 
     # Guardrail middleware (if configured)
     from deerflow.config.guardrails_config import get_guardrails_config

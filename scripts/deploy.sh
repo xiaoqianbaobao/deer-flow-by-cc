@@ -57,7 +57,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 DOCKER_DIR="$REPO_ROOT/docker"
-COMPOSE_CMD=(docker compose -p deer-flow -f "$DOCKER_DIR/docker-compose.yaml")
+COMPOSE_CMD=(docker compose --env-file "$REPO_ROOT/.env" -p deer-flow -f "$DOCKER_DIR/docker-compose.yaml")
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -66,6 +66,17 @@ BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
+
+is_truthy() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 # ── DEER_FLOW_HOME ────────────────────────────────────────────────────────────
 
@@ -119,6 +130,20 @@ if [ ! -f "$DEER_FLOW_EXTENSIONS_CONFIG_PATH" ]; then
     fi
 else
     echo -e "${GREEN}✓ extensions_config.json: $DEER_FLOW_EXTENSIONS_CONFIG_PATH${NC}"
+fi
+
+# ── config/identity.yaml ──────────────────────────────────────────────────────
+
+if [ ! -d "$REPO_ROOT/config" ]; then
+    mkdir -p "$REPO_ROOT/config"
+fi
+
+if [ ! -f "$REPO_ROOT/config/identity.yaml" ]; then
+    cat > "$REPO_ROOT/config/identity.yaml" <<'EOF'
+oidc:
+  providers: {}
+EOF
+    echo -e "${GREEN}✓ Seeded config/identity.yaml with empty OIDC providers${NC}"
 fi
 
 
@@ -242,6 +267,15 @@ case "$RUNTIME_MODE" in
         services="frontend gateway langgraph nginx"
         ;;
 esac
+
+if [ -f "$REPO_ROOT/.env" ]; then
+    # shellcheck disable=SC1090
+    set -a && . "$REPO_ROOT/.env" && set +a
+fi
+
+if is_truthy "${ENABLE_IDENTITY:-false}"; then
+    services="$services postgres redis"
+fi
 
 if [ "$sandbox_mode" = "provisioner" ]; then
     services="$services provisioner"

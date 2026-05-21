@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+from deerflow.config.paths import get_paths
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
@@ -99,10 +100,43 @@ class LocalSandboxProvider(SandboxProvider):
 
         return mappings
 
-    def acquire(self, thread_id: str | None = None) -> str:
+    def acquire(
+        self,
+        thread_id: str | None = None,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> str:
+        """Acquire the local sandbox singleton.
+
+        The local sandbox runs commands directly on the host, so there are no
+        bind mounts to stratify per tenant. Instead, tenant isolation is
+        provided by the thread-data directories that the middleware chain
+        allocates under ``tenants/{tid}/workspaces/{wid}/threads/{thread_id}/``
+        — this method simply ensures those directories exist when identity is
+        in scope so subsequent writes through ``/mnt/user-data/...`` land in
+        the tenant-stratified location.
+
+        When ``tenant_id`` / ``workspace_id`` are missing, the legacy
+        ``threads/{thread_id}/`` layout is used verbatim.
+        """
         global _singleton
         if _singleton is None:
             _singleton = LocalSandbox("local", path_mappings=self._path_mappings)
+
+        if thread_id:
+            try:
+                get_paths().ensure_thread_dirs_for(
+                    thread_id,
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                )
+            except ValueError as exc:
+                # ``ensure_thread_dirs_for`` validates thread_id and the
+                # tenant/workspace ids. A malformed thread_id should surface
+                # loudly; in that case we have already failed earlier in the
+                # middleware chain, so treat this as a hard error.
+                raise ValueError(f"Failed to ensure tenant-aware thread dirs for {thread_id!r}: {exc}") from exc
         return _singleton.id
 
     def get(self, sandbox_id: str) -> Sandbox | None:

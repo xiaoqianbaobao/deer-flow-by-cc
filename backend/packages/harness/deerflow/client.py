@@ -1169,12 +1169,24 @@ class DeerFlowClient:
     # Public API — artifacts
     # ------------------------------------------------------------------
 
-    def get_artifact(self, thread_id: str, path: str) -> tuple[bytes, str]:
+    def get_artifact(
+        self,
+        thread_id: str,
+        path: str,
+        *,
+        tenant_id: int | None = None,
+        workspace_id: int | None = None,
+    ) -> tuple[bytes, str]:
         """Read an artifact file produced by the agent.
 
         Args:
             thread_id: Thread ID.
             path: Virtual path (e.g. "mnt/user-data/outputs/file.txt").
+            tenant_id: Optional tenant ID (M4 storage isolation). When combined
+                with ``workspace_id``, the virtual path resolves under the
+                tenant-stratified layout. Omitting either value preserves the
+                legacy single-tenant layout for flag-off callers.
+            workspace_id: Optional workspace ID (pair with ``tenant_id``).
 
         Returns:
             Tuple of (file_bytes, mime_type).
@@ -1184,7 +1196,7 @@ class DeerFlowClient:
             ValueError: If the path is invalid.
         """
         try:
-            actual = get_paths().resolve_virtual_path(thread_id, path)
+            actual = get_paths().resolve_virtual_path(thread_id, path, tenant_id=tenant_id, workspace_id=workspace_id)
         except ValueError as exc:
             if "traversal" in str(exc):
                 from deerflow.uploads.manager import PathTraversalError

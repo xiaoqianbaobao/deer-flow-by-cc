@@ -3,7 +3,7 @@
 import copy
 from unittest.mock import MagicMock
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 
 from deerflow.agents.middlewares.loop_detection_middleware import (
     _HARD_STOP_MSG,
@@ -636,3 +636,337 @@ class TestToolFrequencyDetection:
         msg = result["messages"][0]
         assert isinstance(msg, AIMessage)
         assert _HARD_STOP_MSG in msg.content
+
+
+class TestPathFailureDetection:
+    """Layer 3: detect repeated *failures* of write_file / str_replace on the same path.
+
+    Motivation: when the agent writes a deliverable to one path but its
+    reasoning later assumes a different path, str_replace on the wrong
+    path keeps returning ``Error: ...`` for varying ``old_str`` / ``new_str``
+    arguments. Layer 1 (hash) and Layer 2 (per-tool frequency) both miss
+    this:
+
+    - Layer 1 intentionally hashes full args for write_file/str_replace
+      (so legitimate iterative editing is not flagged), so each retry
+      with different args produces a different hash.
+    - Layer 2's threshold (50 calls) is far higher than the typical
+      death-spiral length and lets the agent burn many turns first.
+
+    Layer 3 fires only when the same (tool_name, path) pair has produced
+    N consecutive ``Error: ...`` ToolMessages — which is exactly the
+    failure mode and very unlikely to happen on a healthy run.
+    """
+
+    def _ai_call(self, tool_name, path, call_id, **extra_args):
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": tool_name,
+                "id": call_id,
+                "args": {"path": path, **extra_args},
+            }],
+        )
+
+    def _tool_result(self, call_id, content):
+        return ToolMessage(content=content, tool_call_id=call_id)
+
+    def _build_history_with_failed_attempts(self, tool_name, path, failure_count, latest_call_id):
+        """Build a message history simulating ``failure_count`` past failed
+        attempts on (tool_name, path), followed by a fresh AIMessage that is
+        about to make the (failure_count + 1)-th attempt on the same path.
+        """
+        messages = []
+        for i in range(failure_count):
+            cid = f"call_fail_{i}"
+            messages.append(self._ai_call(tool_name, path, cid, old_str=f"v{i}", new_str=f"u{i}"))
+            messages.append(self._tool_result(cid, f"Error: file not found: {path}"))
+        # Latest AIMessage — this is the one loop detection runs on.
+        messages.append(self._ai_call(tool_name, path, latest_call_id, old_str="vN", new_str="uN"))
+        return {"messages": messages}
+
+    def test_no_warn_below_threshold(self):
+        """2 prior failures + 1 fresh call = 3 attempts, below default warn=3."""
+        mw = LoopDetectionMiddleware(path_failure_warn=3, path_failure_hard_limit=4)
+        runtime = _make_runtime()
+
+        state = self._build_history_with_failed_attempts(
+            "str_replace", "/mnt/user-data/outputs/x.html",
+            failure_count=1, latest_call_id="call_latest",
+        )
+        result = mw._apply(state, runtime)
+        assert result is None
+
+    def test_warn_at_path_failure_threshold(self):
+        """3rd attempt on same (tool, path) after 2 prior failures -> warn."""
+        mw = LoopDetectionMiddleware(path_failure_warn=3, path_failure_hard_limit=10)
+        runtime = _make_runtime()
+
+        state = self._build_history_with_failed_attempts(
+            "str_replace", "/mnt/user-data/outputs/x.html",
+            failure_count=2, latest_call_id="call_latest",
+        )
+        result = mw._apply(state, runtime)
+        assert result is not None
+        msg = result["messages"][0]
+        assert isinstance(msg, HumanMessage)
+        assert "LOOP DETECTED" in msg.content
+        # Mention the offending path so the model can self-correct.
+        assert "/mnt/user-data/outputs/x.html" in msg.content
+        assert "str_replace" in msg.content
+
+    def test_hard_stop_at_path_failure_limit(self):
+        """4th attempt with 3 prior failures triggers hard stop."""
+        mw = LoopDetectionMiddleware(path_failure_warn=2, path_failure_hard_limit=4)
+        runtime = _make_runtime()
+
+        state = self._build_history_with_failed_attempts(
+            "str_replace", "/mnt/user-data/outputs/x.html",
+            failure_count=3, latest_call_id="call_latest",
+        )
+        result = mw._apply(state, runtime)
+        assert result is not None
+        ai_msgs = [m for m in result["messages"] if isinstance(m, AIMessage)]
+        assert len(ai_msgs) == 1
+        assert ai_msgs[0].tool_calls == []
+        assert "FORCED STOP" in ai_msgs[0].content
+        assert "/mnt/user-data/outputs/x.html" in ai_msgs[0].content
+
+    def test_successful_tool_calls_reset_streak(self):
+        """A successful (non-Error) ToolMessage breaks the failure streak."""
+        mw = LoopDetectionMiddleware(path_failure_warn=3, path_failure_hard_limit=4)
+        runtime = _make_runtime()
+
+        path = "/mnt/user-data/outputs/x.html"
+        messages = [
+            self._ai_call("str_replace", path, "c1", old_str="a", new_str="b"),
+            self._tool_result("c1", f"Error: file not found: {path}"),
+            self._ai_call("str_replace", path, "c2", old_str="a", new_str="b"),
+            self._tool_result("c2", f"Error: file not found: {path}"),
+            # Successful call mid-stream — should clear the streak
+            self._ai_call("str_replace", path, "c3", old_str="x", new_str="y"),
+            self._tool_result("c3", "OK"),
+            # Latest call: only 1 prior failure since the OK reset
+            self._ai_call("str_replace", path, "c_latest", old_str="z", new_str="w"),
+        ]
+        result = mw._apply({"messages": messages}, runtime)
+        assert result is None
+
+    def test_different_paths_tracked_independently(self):
+        """Failures on /a.html should not contaminate /b.html's counter."""
+        mw = LoopDetectionMiddleware(path_failure_warn=3, path_failure_hard_limit=4)
+        runtime = _make_runtime()
+
+        messages = [
+            # 2 failures on /a.html
+            self._ai_call("str_replace", "/a.html", "ca1", old_str="x", new_str="y"),
+            self._tool_result("ca1", "Error: not found"),
+            self._ai_call("str_replace", "/a.html", "ca2", old_str="x", new_str="y"),
+            self._tool_result("ca2", "Error: not found"),
+            # Latest call is on /b.html — first attempt, no prior failures on /b.html
+            self._ai_call("str_replace", "/b.html", "cb1", old_str="x", new_str="y"),
+        ]
+        result = mw._apply({"messages": messages}, runtime)
+        assert result is None
+
+    def test_only_applies_to_write_file_and_str_replace(self):
+        """read_file failures are not part of this signature (cross-file
+        exploration after a missing target is legitimate)."""
+        mw = LoopDetectionMiddleware(path_failure_warn=3, path_failure_hard_limit=4)
+        runtime = _make_runtime()
+
+        path = "/mnt/user-data/outputs/x.html"
+        messages = []
+        for i in range(3):
+            cid = f"cr{i}"
+            messages.append(AIMessage(
+                content="",
+                tool_calls=[{"name": "read_file", "id": cid, "args": {"path": path}}],
+            ))
+            messages.append(self._tool_result(cid, "Error: file not found"))
+        messages.append(AIMessage(
+            content="",
+            tool_calls=[{"name": "read_file", "id": "cr_latest", "args": {"path": path}}],
+        ))
+        result = mw._apply({"messages": messages}, runtime)
+        # Layer 3 should not fire on read_file. Layer 1/2 may also not fire
+        # under default thresholds — confirm: result is None.
+        assert result is None
+
+    def test_write_file_path_failure_also_detected(self):
+        """write_file path failures should be flagged the same as str_replace."""
+        mw = LoopDetectionMiddleware(path_failure_warn=3, path_failure_hard_limit=10)
+        runtime = _make_runtime()
+
+        path = "/mnt/user-data/outputs/x.html"
+        messages = [
+            self._ai_call("write_file", path, "cw1", content="v1"),
+            self._tool_result("cw1", f"Error: Permission denied writing to file: {path}"),
+            self._ai_call("write_file", path, "cw2", content="v2"),
+            self._tool_result("cw2", f"Error: Permission denied writing to file: {path}"),
+            self._ai_call("write_file", path, "cw_latest", content="v3"),
+        ]
+        result = mw._apply({"messages": messages}, runtime)
+        assert result is not None
+        assert "LOOP DETECTED" in result["messages"][0].content
+        assert "write_file" in result["messages"][0].content
+
+
+class TestHardStopOrphanToolMessageRemoval:
+    """Hard stop must clean orphan ToolMessages whose tool_call_id matches
+    the AIMessage being stripped. Otherwise strict providers (MiniMax/Anthropic)
+    reject the next call with 400 "tool result's tool id ... not found".
+
+    Spec: docs/superpowers/specs/2026-04-27-loop-detection-orphan-tool-msg.md
+    """
+
+    def _state_with_tool_msg(self, tool_calls, tool_call_ids_for_results):
+        """Build state where AIMessage has tool_calls AND matching ToolMessages
+        already exist in history (simulates: tools already executed, history
+        has the responses, then loop detection fires hard_stop)."""
+        ai_msg = AIMessage(content="thinking...", tool_calls=tool_calls)
+        tool_msgs = [
+            ToolMessage(content=f"result for {tcid}", tool_call_id=tcid)
+            for tcid in tool_call_ids_for_results
+        ]
+        # Order in real history: AI msg → its ToolMessages.
+        # But the LATEST AIMessage (the one with the loop) is at the end.
+        # For loop detection to trigger on it, it must be messages[-1].
+        # So we layer: prior AIMessage with tool_calls → prior ToolMessages → latest looping AIMessage.
+        prior_ai = AIMessage(
+            content="prior turn",
+            tool_calls=[{"name": tc["name"], "id": tcid, "args": tc["args"]}
+                        for tc, tcid in zip(tool_calls, tool_call_ids_for_results)],
+        )
+        return {"messages": [prior_ai, *tool_msgs, ai_msg]}
+
+    def test_hard_stop_emits_remove_message_for_orphan_tool_msg(self):
+        """When hard_stop strips tool_calls from last AIMessage, any ToolMessage
+        in history whose tool_call_id matches must be removed via RemoveMessage."""
+        mw = LoopDetectionMiddleware(warn_threshold=2, hard_limit=4)
+        runtime = _make_runtime()
+
+        looping_call_id = "call_loop_1"
+        tool_calls = [{"name": "bash", "id": looping_call_id, "args": {"command": "ls"}}]
+
+        # Trip the loop detector with 3 prior identical calls
+        for _ in range(3):
+            mw._apply(_make_state(tool_calls=tool_calls), runtime)
+
+        # 4th call: hard_stop fires. Build state where the looping AIMessage's
+        # tool_call already produced a ToolMessage in history.
+        state = self._state_with_tool_msg(tool_calls, [looping_call_id])
+        result = mw._apply(state, runtime)
+
+        assert result is not None
+        msgs = result["messages"]
+        # Expect: at least one RemoveMessage + the stripped AIMessage
+        remove_msgs = [m for m in msgs if isinstance(m, RemoveMessage)]
+        ai_msgs = [m for m in msgs if isinstance(m, AIMessage)]
+
+        assert len(remove_msgs) == 1, f"expected 1 RemoveMessage, got {remove_msgs}"
+        assert len(ai_msgs) == 1, f"expected 1 stripped AIMessage, got {ai_msgs}"
+
+        # The RemoveMessage targets the orphan ToolMessage by its message id.
+        # ToolMessage in fixture had no explicit id, so langchain auto-assigns one.
+        # Look up the orphan in fixture state and verify the RemoveMessage points to it.
+        orphan_tool_msg = next(
+            m for m in state["messages"]
+            if isinstance(m, ToolMessage) and m.tool_call_id == looping_call_id
+        )
+        assert remove_msgs[0].id == orphan_tool_msg.id
+
+        # The stripped AIMessage must have tool_calls cleared (existing contract)
+        assert ai_msgs[0].tool_calls == []
+        assert _HARD_STOP_MSG in ai_msgs[0].content
+
+    def test_hard_stop_no_remove_when_no_orphan_exists(self):
+        """If the looping AIMessage's tool_calls have not been executed yet
+        (no matching ToolMessage in history), no RemoveMessage is emitted.
+        This covers the case where loop detection fires in after_model
+        before the tool node runs."""
+        mw = LoopDetectionMiddleware(warn_threshold=2, hard_limit=4)
+        runtime = _make_runtime()
+
+        tool_calls = [{"name": "bash", "id": "call_no_result", "args": {"command": "ls"}}]
+
+        for _ in range(3):
+            mw._apply(_make_state(tool_calls=tool_calls), runtime)
+
+        # 4th call: hard_stop fires, but ToolMessage hasn't been added to history
+        result = mw._apply(_make_state(tool_calls=tool_calls), runtime)
+
+        assert result is not None
+        msgs = result["messages"]
+        remove_msgs = [m for m in msgs if isinstance(m, RemoveMessage)]
+        ai_msgs = [m for m in msgs if isinstance(m, AIMessage)]
+
+        assert len(remove_msgs) == 0, f"no orphan exists → no RemoveMessage; got {remove_msgs}"
+        assert len(ai_msgs) == 1
+        assert ai_msgs[0].tool_calls == []
+
+    def test_hard_stop_removes_only_matching_orphans_not_unrelated_tool_msgs(self):
+        """Narrow scope: RemoveMessage targets ONLY ToolMessages whose tool_call_id
+        is in the looping AIMessage's tool_calls. Unrelated ToolMessages from
+        prior valid turns must remain untouched."""
+        mw = LoopDetectionMiddleware(warn_threshold=2, hard_limit=4)
+        runtime = _make_runtime()
+
+        looping_id = "call_loop"
+        unrelated_id = "call_unrelated_earlier_turn"
+
+        tool_calls = [{"name": "bash", "id": looping_id, "args": {"command": "ls"}}]
+
+        for _ in range(3):
+            mw._apply(_make_state(tool_calls=tool_calls), runtime)
+
+        # Build history with:
+        #   - unrelated valid AI+Tool pair from earlier (must NOT be removed)
+        #   - looping AI msg with its already-produced ToolMessage (orphan to clean)
+        unrelated_ai = AIMessage(
+            content="earlier valid turn",
+            tool_calls=[{"name": "bash", "id": unrelated_id, "args": {"command": "pwd"}}],
+        )
+        unrelated_tool = ToolMessage(content="/home", tool_call_id=unrelated_id, id="msg_unrelated_tool")
+        looping_orphan_tool = ToolMessage(content="result", tool_call_id=looping_id, id="msg_looping_orphan")
+        looping_ai = AIMessage(content="loop", tool_calls=tool_calls)
+
+        state = {
+            "messages": [unrelated_ai, unrelated_tool, looping_orphan_tool, looping_ai]
+        }
+        result = mw._apply(state, runtime)
+
+        assert result is not None
+        remove_msgs = [m for m in result["messages"] if isinstance(m, RemoveMessage)]
+        # Only the looping orphan ToolMessage gets removed
+        assert len(remove_msgs) == 1
+        assert remove_msgs[0].id == looping_orphan_tool.id
+        # The unrelated ToolMessage's id must NOT be in any RemoveMessage
+        removed_ids = {m.id for m in remove_msgs}
+        assert unrelated_tool.id not in removed_ids
+
+    def test_hard_stop_handles_multiple_tool_calls_in_one_message(self):
+        """Hard-stop AIMessage may carry several tool_calls; each with a matching
+        ToolMessage in history must produce its own RemoveMessage."""
+        mw = LoopDetectionMiddleware(warn_threshold=2, hard_limit=4)
+        runtime = _make_runtime()
+
+        ids = ["call_a", "call_b"]
+        tool_calls = [
+            {"name": "bash", "id": "call_a", "args": {"command": "ls"}},
+            {"name": "bash", "id": "call_b", "args": {"command": "pwd"}},
+        ]
+
+        for _ in range(3):
+            mw._apply(_make_state(tool_calls=tool_calls), runtime)
+
+        looping_ai = AIMessage(content="loop", tool_calls=tool_calls)
+        orphans = [ToolMessage(content=f"r_{tcid}", tool_call_id=tcid) for tcid in ids]
+        state = {"messages": [*orphans, looping_ai]}
+
+        result = mw._apply(state, runtime)
+        assert result is not None
+        remove_msgs = [m for m in result["messages"] if isinstance(m, RemoveMessage)]
+        assert len(remove_msgs) == 2
+        removed_ids = {m.id for m in remove_msgs}
+        assert removed_ids == {orphans[0].id, orphans[1].id}

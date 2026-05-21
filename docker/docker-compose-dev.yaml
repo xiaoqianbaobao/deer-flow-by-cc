@@ -113,6 +113,7 @@ services:
       - NODE_ENV=development
       - WATCHPACK_POLLING=true
       - CI=true
+      - NEXT_PUBLIC_ENABLE_IDENTITY=${ENABLE_IDENTITY:-false}
       - DEER_FLOW_INTERNAL_GATEWAY_BASE_URL=http://gateway:8001
       - DEER_FLOW_INTERNAL_LANGGRAPH_BASE_URL=http://langgraph:2024
     env_file:
@@ -140,6 +141,7 @@ services:
       # directory above would otherwise shadow it with the (empty) host directory.
       - gateway-venv:/app/backend/.venv
       - ../config.yaml:/app/config.yaml
+      - ../config:/app/config:ro
       - ../extensions_config.json:/app/extensions_config.json
       - ../skills:/app/skills
       - ../logs:/app/logs
@@ -151,13 +153,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # CLI auth directories for auto-auth (Claude Code + Codex CLI)
       - type: bind
-        source: ${HOME:?HOME must be set}/.claude
+        source: ~/.claude
         target: /root/.claude
         read_only: true
         bind:
           create_host_path: true
       - type: bind
-        source: ${HOME:?HOME must be set}/.codex
+        source: ~/.codex
         target: /root/.codex
         read_only: true
         bind:
@@ -166,6 +168,7 @@ services:
     environment:
       - CI=true
       - DEER_FLOW_HOME=/app/backend/.deer-flow
+      - DEERFLOW_IDENTITY_CONFIG=/app/config/identity.yaml
       - DEER_FLOW_CHANNELS_LANGGRAPH_URL=${DEER_FLOW_CHANNELS_LANGGRAPH_URL:-http://langgraph:2024}
       - DEER_FLOW_CHANNELS_GATEWAY_URL=${DEER_FLOW_CHANNELS_GATEWAY_URL:-http://gateway:8001}
       - DEER_FLOW_HOST_BASE_DIR=${DEER_FLOW_ROOT}/backend/.deer-flow
@@ -199,6 +202,7 @@ services:
       # directory above would otherwise shadow it with the (empty) host directory.
       - langgraph-venv:/app/backend/.venv
       - ../config.yaml:/app/config.yaml
+      - ../config:/app/config:ro
       - ../extensions_config.json:/app/extensions_config.json
       - ../skills:/app/skills
       - ../logs:/app/logs
@@ -210,13 +214,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # CLI auth directories for auto-auth (Claude Code + Codex CLI)
       - type: bind
-        source: ${HOME:?HOME must be set}/.claude
+        source: ~/.claude
         target: /root/.claude
         read_only: true
         bind:
           create_host_path: true
       - type: bind
-        source: ${HOME:?HOME must be set}/.codex
+        source: ~/.codex
         target: /root/.codex
         read_only: true
         bind:
@@ -225,6 +229,7 @@ services:
     environment:
       - CI=true
       - DEER_FLOW_HOME=/app/backend/.deer-flow
+      - DEERFLOW_IDENTITY_CONFIG=/app/config/identity.yaml
       - DEER_FLOW_HOST_BASE_DIR=${DEER_FLOW_ROOT}/backend/.deer-flow
       - DEER_FLOW_HOST_SKILLS_PATH=${DEER_FLOW_ROOT}/skills
       - DEER_FLOW_SANDBOX_HOST=host.docker.internal
@@ -237,6 +242,42 @@ services:
       - deer-flow-dev
     restart: unless-stopped
 
+  # ── Postgres (identity subsystem) ─────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deerflow}
+      POSTGRES_USER: ${POSTGRES_USER:-deerflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deerflow}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - deerflow_postgres_dev:/var/lib/postgresql/data
+    networks:
+      - deer-flow-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deerflow} -d ${POSTGRES_DB:-deerflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis (identity subsystem) ────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - deerflow_redis_dev:/data
+    networks:
+      - deer-flow-dev
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
 volumes:
   # Persist .venv across container restarts so dependencies installed during
   # image build are not shadowed by the host backend/ directory mount.
@@ -244,6 +285,8 @@ volumes:
   langgraph-venv:
   gateway-uv-cache:
   langgraph-uv-cache:
+  deerflow_postgres_dev:
+  deerflow_redis_dev:
 
 networks:
   deer-flow-dev:

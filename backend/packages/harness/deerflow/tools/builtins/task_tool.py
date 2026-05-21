@@ -100,11 +100,15 @@ async def task_tool(
     thread_id = None
     parent_model = None
     trace_id = None
+    identity = None
     metadata: dict = {}
 
     if runtime is not None:
         sandbox_state = runtime.state.get("sandbox")
         thread_data = runtime.state.get("thread_data")
+        # M5: inherit parent identity so subagent tool calls enforce the
+        # same permissions (spec §6.4: "task sub agent 继承主 identity").
+        identity = runtime.state.get("identity")
         thread_id = runtime.context.get("thread_id") if runtime.context else None
         if thread_id is None:
             thread_id = runtime.config.get("configurable", {}).get("thread_id")
@@ -142,6 +146,7 @@ async def task_tool(
         thread_data=thread_data,
         thread_id=thread_id,
         trace_id=trace_id,
+        identity=identity,
     )
 
     # Start background execution (always async to prevent blocking)

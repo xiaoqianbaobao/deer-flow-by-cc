@@ -1,20 +1,182 @@
-# 🦌 DeerFlow - 2.0
+# 🦌 deer-flow-by-cc — Self-Hosted Multi-Tenant DeerFlow
 
-English | [中文](./README_zh.md) | [日本語](./README_ja.md) | [Français](./README_fr.md) | [Русский](./README_ru.md)
+English | [中文](./README_zh.md) | [Français](./README_fr.md) | [Русский](./README_ru.md)
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](./backend/pyproject.toml)
 [![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white)](./Makefile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Upstream: bytedance/deer-flow](https://img.shields.io/badge/Upstream-bytedance%2Fdeer--flow-blue)](https://github.com/bytedance/deer-flow)
 
-<a href="https://trendshift.io/repositories/14699" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14699" alt="bytedance%2Fdeer-flow | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-> On February 28th, 2026, DeerFlow claimed the 🏆 #1 spot on GitHub Trending following the launch of version 2. Thanks a million to our incredible community — you made this happen! 💪🔥
+> A production-ready, self-hosted fork of [DeerFlow](https://github.com/bytedance/deer-flow) with **enterprise identity**, **multi-tenant isolation**, and **security hardening** — designed to run privately for your team without giving up upstream's research, sub-agent, and skill capabilities.
+
+This repository is a community fork of [`bytedance/deer-flow`](https://github.com/bytedance/deer-flow). It tracks upstream closely (every feature you see in upstream's README still works here) and adds the missing pieces a small team needs to actually deploy DeerFlow as a shared service: real login, tenant isolation, audit, session resilience, and skill governance.
+
+If you just want to evaluate DeerFlow on your laptop with hosted model APIs, [the upstream repo](https://github.com/bytedance/deer-flow) is the right place to start. If you want to host DeerFlow for your team, keep reading.
+
+---
+
+## 🚀 What This Fork Adds
+
+All additions are **opt-in**. With `ENABLE_IDENTITY=false` (the default), this fork behaves identically to upstream — the changes are dormant.
+
+### 🔐 Enterprise Identity
+
+- **OIDC + password login** side by side (Okta / Azure AD / Keycloak / etc.) — `/api/auth/oidc/{provider}/login` for SSO, password login for service accounts and break-glass.
+- **Self-service registration via codes** — admins generate single-use registration codes (`POST /api/tenants/{tid}/registration-codes`), users redeem them at `/register`. No email server required.
+- **First-run admin bootstrap** — `DEERFLOW_BOOTSTRAP_ADMIN_EMAIL` provisions the platform admin idempotently on startup; admin can change password from the UI.
+- **JWT RS256** — `make identity-keys` writes a 2048-bit keypair under `$DEERFLOW_HOME/_system/`; gateway auto-generates if missing.
+
+### 🛡️ Security Hardening
+
+- **Gateway authn baseline** — all 14 legacy `/api/*` routers require auth by default; `PUBLIC_PREFIXES` is an explicit allowlist (auth flow, `/health`, `/metrics`, internal/audit). Closes a P0 hole where `ENABLE_IDENTITY=true` still left legacy routes wide open.
+- **Session resilience** — 401 responses transparently trigger a singleflight refresh + retry instead of dropping the user to a "Session expired" modal. Both the identity fetch layer and the LangGraph SDK fetch transport share the same singleflight.
+- **Cookie TTL decoupling** — `deerflow_session` `Max-Age` now tracks `refresh_ttl_sec` (7 days) instead of `access_ttl_sec` (15 min), so closing the laptop overnight no longer signs you out.
+- **Audit pipeline** — every authenticated write, RBAC denial, login, and tool denial flows through `AuditMiddleware` → `audit_logs` table; critical events fall back to JSONL on disk if Postgres is unreachable; CSV export with cursor-based pagination.
+
+### 🏢 Multi-Tenant Isolation
+
+- **Per-tenant filesystem layout** under `$DEER_FLOW_HOME` — sandbox bind-mounts, thread data, uploads, outputs, and tenant-scoped skills are physically separated. Cross-tenant access is rejected at the gateway, the sandbox mount layer, and the path guard.
+- **Thread store namespace per user** — listing threads no longer leaks across users on shared deployments.
+- **Tenant-scoped registration codes & roles** — `workspace_member` role added with permission set sized for invited users.
+
+### 🧩 Skill & Agent Governance
+
+- **Skill approval workflow** — pending skills go through `GET /api/admin/skills/pending` → approve/reject; admin UI shows pending / reviewed (rejected + archived) tabs.
+- **Skill bind to thread** — bind skills to a thread via `POST /api/threads/{tid}/skills`, see `/skill-name` badges in chat, "Load to chat" deep-links work end-to-end.
+- **Custom agent edit page** — edit `description / model / SOUL / tool_groups / skills / org_key_env` from the UI with a `tool_groups` dropdown backed by `GET /api/tool-groups`.
+- **Admin pages** — Models management, password change, i18n labels for admin sections.
+
+### ⚙️ Runtime Stability
+
+- **`deerflow.runtime.main_loop` singleton** — Gateway mode uses a process-wide event loop registered via lifespan, eliminating the recurring `Event loop is closed` errors on long sessions and across sub-agent boundaries.
+- **Summarization cascade fix** — prior summaries are tagged in `additional_kwargs` and stripped on the next pass, so the summary text feeds in as a `prior_summary` seed instead of being re-summarized into oblivion.
+- **Tool-call recovery** — `LoopDetectionMiddleware`'s hard-stop now emits `RemoveMessage` for orphaned `ToolMessage`s on the same turn, preventing 400s from providers that strictly validate `tool_call_id` sequences.
+
+### 💬 Frontend Polish
+
+- **401 modal coalescing** — concurrent 401s no longer stack three "Session expired" modals on top of each other.
+- **Chat surface fixes** — `todo_completion_reminder` is filtered alongside `todo_reminder` so LLM error frames don't leak into the chat as fake user messages.
+- **i18n updates** — Models admin labels, registration page, dropped marketing copy from welcome screen.
+
+> **Want the full picture?** Each shipped change has a spec in [`docs/superpowers/specs/archive/`](docs/superpowers/specs/archive/) and an implementation plan in [`docs/plans/archive/`](docs/plans/archive/). The active roadmap lives in [`docs/superpowers/specs/`](docs/superpowers/specs/).
+
+---
+
+## 🤔 Why Use This Fork?
+
+| Your situation | Use upstream `bytedance/deer-flow` | Use `deer-flow-by-cc` |
+|---|:---:|:---:|
+| Single developer, local only | ✅ | — |
+| Evaluation / demo on a laptop | ✅ | — |
+| Self-hosted for a team (2–50 users) | — | ✅ |
+| Need real login (OIDC or password) | — | ✅ |
+| Need tenant data isolation | — | ✅ |
+| Need audit logs for compliance | — | ✅ |
+| Want skill approval workflow before users can publish | — | ✅ |
+| Already running upstream and don't need any of the above | ✅ | — |
+
+**Upgrade path:** This fork is a strict superset. You can switch by re-pointing your `git remote` and running `make db-upgrade`; with `ENABLE_IDENTITY=false` your existing deployment behaves identically.
+
+---
+
+## ⚡ Quick Start: Self-Hosted Mode
+
+The full Quick Start (Docker / local dev / sandbox) is in the [Inherited Documentation](#-inherited-from-upstream-deerflow) below. This section only covers what's specific to **enabling identity**.
+
+### 1. Fastest path (Docker dev)
+
+```bash
+# The Docker dev startup now automatically:
+# - enables ENABLE_IDENTITY=true
+# - provisions local Postgres / Redis defaults
+# - creates config/identity.yaml with empty OIDC providers
+# - runs Alembic migrations
+# - generates JWT keys
+# - initializes the bootstrap admin password
+./scripts/docker.sh start
+```
+
+Default local development credentials:
+
+- Email: `admin@local.deerflow`
+- Password: `DeerFlow123!`
+- Reset token: `deerflow-bootstrap-local`
+
+Dependency containers are brought up automatically:
+
+- `postgres:16-alpine`
+- `redis:7-alpine`
+
+### 2. Equivalent manual configuration
+
+```bash
+# .env
+ENABLE_IDENTITY=true
+DEERFLOW_DATABASE_URL=postgresql+asyncpg://deerflow:deerflow@postgres:5432/deerflow
+DEERFLOW_REDIS_URL=redis://redis:6379/0
+DEERFLOW_BOOTSTRAP_ADMIN_EMAIL=admin@local.deerflow
+DEERFLOW_BOOTSTRAP_ADMIN_PASSWORD=DeerFlow123!
+DEERFLOW_BOOTSTRAP_PASSWORD_TOKEN=deerflow-bootstrap-local
+DEERFLOW_COOKIE_SECURE=false
+DEERFLOW_INTERNAL_SIGNING_KEY=replace-this-hmac-key
+REGISTRATION_CODE_EXPIRES_DAYS=7
+```
+
+### 3. (Optional) Configure OIDC
+
+```bash
+cp config/identity.yaml.example config/identity.yaml
+# fill in at least one provider — $VAR references resolve from environment
+```
+
+If you do not configure OIDC yet, the repo now seeds a valid minimal file:
+
+```yaml
+oidc:
+  providers: {}
+```
+
+### 4. Start the stack and onboard your team
+
+```bash
+make docker-start   # Docker development
+# or make up        # production Docker compose
+```
+
+Then:
+
+1. The bootstrap admin signs in at `/login` with the default local account above, or your customized `.env` credentials.
+2. Admin generates registration codes: `POST /api/tenants/{tid}/registration-codes`.
+3. Team members visit `/register`, paste the code, set their password, and they're in.
+
+For the full design, including audit retention, RBAC scopes, and storage layout, see [`docs/superpowers/specs/archive/2026-04-21-deerflow-identity-foundation-design.md`](docs/superpowers/specs/archive/2026-04-21-deerflow-identity-foundation-design.md).
+
+---
+
+## 🗺️ Roadmap & Status
+
+| Area | Status | Notes |
+|---|---|---|
+| Identity foundation (M1–M7) | ✅ Shipped | OIDC, password, registration codes, RBAC, audit, multi-tenant FS |
+| Session refresh resilience | ✅ Shipped | 401-refresh-retry across `identityFetch` + LangGraph SDK |
+| Gateway authn baseline (P0) | ✅ Shipped | 14 legacy routers locked down |
+| Summarization cascade fix | ✅ Shipped | Prior-summary marker, no re-summarization |
+| Skill approval workflow | ✅ Shipped | Pending / reviewed tabs, bind-to-thread |
+| Email notification on registration | 🟡 Deferred | Codes are share-via-channel-of-your-choice today |
+| Self-hosted deployment epic (one-command setup) | 🔜 Planned | Tracked separately |
+
+---
+
+## 📦 Inherited from Upstream DeerFlow
+
+Everything below this line is upstream documentation, kept intact so you have a single source of truth. Skills, sandbox, sub-agents, MCP, IM channels, embedded Python client — all of it works exactly as upstream describes.
+
+> [!NOTE]
+> **DeerFlow 2.0 is a ground-up rewrite.** It shares no code with v1. If you're looking for the original Deep Research framework, it's maintained on the [`1.x` branch](https://github.com/bytedance/deer-flow/tree/main-1.x) — contributions there are still welcome. Active development has moved to 2.0.
 
 DeerFlow (**D**eep **E**xploration and **E**fficient **R**esearch **Flow**) is an open-source **super agent harness** that orchestrates **sub-agents**, **memory**, and **sandboxes** to do almost anything — powered by **extensible skills**.
 
 https://github.com/user-attachments/assets/a8bcadc4-e040-4cf2-8fda-dd768b999c18
-
-> [!NOTE]
-> **DeerFlow 2.0 is a ground-up rewrite.** It shares no code with v1. If you're looking for the original Deep Research framework, it's maintained on the [`1.x` branch](https://github.com/bytedance/deer-flow/tree/main-1.x) — contributions there are still welcome. Active development has moved to 2.0.
 
 ## Official Website
 
@@ -44,7 +206,12 @@ DeerFlow has newly integrated the intelligent search and crawling toolset indepe
 
 ## Table of Contents
 
-- [🦌 DeerFlow - 2.0](#-deerflow---20)
+- [🦌 deer-flow-by-cc — Self-Hosted Multi-Tenant DeerFlow](#-deer-flow-by-cc--self-hosted-multi-tenant-deerflow)
+  - [🚀 What This Fork Adds](#-what-this-fork-adds)
+  - [🤔 Why Use This Fork?](#-why-use-this-fork)
+  - [⚡ Quick Start: Self-Hosted Mode](#-quick-start-self-hosted-mode)
+  - [🗺️ Roadmap & Status](#️-roadmap--status)
+  - [📦 Inherited from Upstream DeerFlow](#-inherited-from-upstream-deerflow)
   - [Official Website](#official-website)
   - [Coding Plan from ByteDance Volcengine](#coding-plan-from-bytedance-volcengine)
   - [InfoQuest](#infoquest)
@@ -202,6 +369,47 @@ That prompt is intended for coding agents. It tells the agent to clone the repo 
 
    </details>
 
+#### Optional: Enterprise Identity (Preview)
+
+DeerFlow includes an opt-in enterprise identity subsystem (multi-tenant, RBAC, audit). It is **off by default** — current single-user installations behave exactly as before.
+
+To enable:
+
+1. Provision Postgres 16 + Redis 7 (`docker/docker-compose.yaml` ships both as optional services).
+2. Run migrations: `cd backend && make db-upgrade`
+3. Set env vars:
+   - `ENABLE_IDENTITY=true`
+   - `DEERFLOW_DATABASE_URL=postgresql+asyncpg://...`
+   - `DEERFLOW_REDIS_URL=redis://...`
+   - `DEERFLOW_BOOTSTRAP_ADMIN_EMAIL=you@example.com` (optional — creates the first platform admin)
+4. **Configure OIDC providers** (M2): copy `config/identity.yaml.example` to `config/identity.yaml` and fill in at least one provider (Okta, Azure AD, Keycloak, …). `$VAR` references are resolved against the environment, so credentials stay in your env file.
+5. **Generate JWT keys** (M2): `cd backend && make identity-keys` writes a 2048-bit RS256 keypair to `$DEERFLOW_HOME/_system/jwt_{private,public}.pem` (0600/0644). The gateway will generate them on first start if absent, but running the target explicitly is safer for production.
+6. **Pick your storage root** (M4, optional): tenant-isolated filesystem state lives under `$DEER_FLOW_HOME` (default: `backend/.deer-flow`). Override it per-deployment — for example `DEER_FLOW_HOME=/var/lib/deerflow` — when you want the tenant tree on a dedicated volume. Bootstrap the directory layout for a new tenant/workspace with:
+   ```bash
+   cd backend && make identity-dirs TENANT_ID=<id> [WORKSPACE_ID=<id>]
+   ```
+   The target is idempotent and creates every directory with `0700` permissions. Layout:
+   ```
+   $DEER_FLOW_HOME/
+     tenants/{tenant_id}/
+       custom/                             # tenant-scoped skills
+       users/{user_id}/memory.json         # per-user memory
+       workspaces/{workspace_id}/
+         user/                             # workspace user-tier skills
+         threads/{thread_id}/
+           user-data/{workspace,uploads,outputs}
+           acp-workspace/
+     skills/public/                        # cross-tenant shared skills
+     _system/{audit_fallback,audit_archive,...}
+   ```
+7. Start the gateway normally. Bootstrap runs idempotently at startup.
+
+Once enabled, users sign in at `/api/auth/oidc/{provider}/login`, receive an HttpOnly `deerflow_session` cookie, and can manage their session + API tokens under `/api/me/*`. M3 adds route-level RBAC (the `@requires(tag, scope)` dependency), a SQLAlchemy auto-filter that scopes every query to the caller's tenant/workspace, and the read-only `/api/roles` + `/api/permissions` endpoints used by UI guards. M4 adds per-tenant/workspace storage isolation: sandbox bind mounts, thread data, uploads, artifacts, and tenant-scoped skills are all physically separated under `$DEER_FLOW_HOME`, with cross-tenant access rejected at the Gateway (`403 Access denied`) and at the sandbox mount / path-guard layers.
+
+**Audit (M6):** every authenticated write, every authorization denial, every login/logout, and every tool denial reported by the LangGraph runtime is captured by the `AuditMiddleware` + `AuditBatchWriter` pipeline and persisted to `identity.audit_logs`. `GET /api/tenants/{tid}/audit` returns paginated rows (default 7-day / max 90-day window, base64url cursor); `GET /api/tenants/{tid}/audit/export` streams CSV (hard-capped at 100k rows). Sensitive fields (passwords, tokens, secrets, request bodies) are scrubbed before enqueue; `write_file` calls keep `path`+`size` only. When Postgres is unreachable, **critical** events (logins, RBAC denies, role grants) fall back to `$DEER_FLOW_HOME/_audit/fallback.jsonl` and are backfilled on the next successful flush — non-critical events are dropped with a metric. The `audit_logs` table is locked down at the DB layer: the `deerflow` app role only has `INSERT, SELECT` (the alembic migration `20260421_0003_audit_grants.py` enforces this; superuser deploys aren't affected by GRANT). Run `app.gateway.identity.audit.retention.run_retention_job(...)` (or wire it via `start_retention_task`) to archive rows older than 90 days into gzip JSONL under `{archive_dir}/{tenant_id}/{yyyy-mm}.jsonl.gz` and delete them from PG.
+
+Full roadmap and design: [`docs/superpowers/specs/archive/2026-04-21-deerflow-identity-foundation-design.md`](docs/superpowers/specs/archive/2026-04-21-deerflow-identity-foundation-design.md).
+
 ### Running the Application
 
 #### Deployment Sizing
@@ -227,9 +435,19 @@ make docker-init    # Pull sandbox image (only once or when image updates)
 make docker-start   # Start services (auto-detects sandbox mode from config.yaml)
 ```
 
+If you want a step-by-step local Docker walkthrough that covers startup, the login page, admin sign-in, and entering the workspace, see:
+
+- [Local Docker Run + Login Guide (Chinese)](docs/LOCAL_DOCKER_LOGIN_GUIDE_zh.md)
+
 `make docker-start` starts `provisioner` only when `config.yaml` uses provisioner mode (`sandbox.use: deerflow.community.aio_sandbox:AioSandboxProvider` with `provisioner_url`).
 
-Docker builds use the upstream `uv` registry by default. If you need faster mirrors in restricted networks, export `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` and `NPM_REGISTRY=https://registry.npmmirror.com` before running `make docker-init` or `make docker-start`.
+In Docker development, the default `extensions_config.json` now points the `filesystem` MCP server at `/app`, which exists inside the containers. Leaving the placeholder path (for example `/path/to/allowed/files`) will surface as `Unable to add filesystem: <illegal path>` when you enable the filesystem MCP server.
+
+When identity is not enabled (`ENABLE_IDENTITY=false`, the default), the frontend now opens the workspace directly instead of incorrectly forcing `/login`. Only turn on the login flow after you have also configured the identity backend prerequisites (database, Redis, JWT keys, and optional OIDC providers).
+
+Docker builds use the upstream registries by default. If you need faster mirrors in restricted networks, export `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`, `NPM_REGISTRY=https://registry.npmmirror.com`, and optionally `APT_MIRROR=mirrors.aliyun.com` (or another Debian mirror host) before running `make docker-init` or `make docker-start`.
+
+The backend Docker image now keeps the Debian mirror override optional and adds retry/backoff around `apt-get` to reduce transient `502 Bad Gateway` failures during image builds.
 
 Backend processes automatically pick up `config.yaml` changes on the next config access, so model metadata updates do not require a manual restart during development.
 
@@ -262,9 +480,27 @@ On Windows, run the local development flow from Git Bash. Native `cmd.exe` and P
    make check  # Verifies Node.js 22+, pnpm, uv, nginx
    ```
 
+   <details>
+   <summary>Using <a href="https://mise.jdx.dev/">mise</a> to manage tool versions (recommended)</summary>
+
+   The repo ships a [`mise.toml`](./mise.toml) that pins Python, Node, uv, and pnpm to the versions this project expects. If you have mise installed:
+
+   ```bash
+   mise install   # one-shot install of all four tools at the right versions
+   mise current   # verify
+   ```
+
+   `nginx` is **not** managed by mise (the mise plugins for nginx are unstable). Install it separately, e.g. `brew install nginx` on macOS or `apt install nginx` on Debian/Ubuntu.
+
+   Notes:
+   - `UV_PYTHON_DOWNLOADS=never` and `UV_PYTHON_PREFERENCE=only-system` are set in `mise.toml` so `uv` reuses the mise-provided Python instead of downloading its own copy.
+   - `packageManager` in `frontend/package.json` pins pnpm to `10.26.2`; mise installs the same version, so Corepack and `pnpm install` stay in sync.
+
+   </details>
+
 2. **Install dependencies**:
    ```bash
-   make install  # Install backend + frontend dependencies + pre-commit hooks
+   make install  # Install backend + frontend dependencies
    ```
 
 3. **(Optional) Pre-pull sandbox image**:
@@ -377,8 +613,8 @@ DeerFlow supports receiving tasks from messaging apps. Channels auto-start when 
 channels:
   # LangGraph Server URL (default: http://localhost:2024)
   langgraph_url: http://localhost:2024
-  # Gateway API URL (default: http://localhost:8001)
-  gateway_url: http://localhost:8001
+  # Gateway API URL (default: http://localhost:8100)
+  gateway_url: http://localhost:8100
 
   # Optional: global session defaults for all mobile channels
   session:

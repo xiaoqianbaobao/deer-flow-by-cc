@@ -26,6 +26,7 @@ venv/
 # Configuration files
 config.yaml
 mcp_config.json
+.mcp.json
 extensions_config.json
 
 # IDE
@@ -36,6 +37,8 @@ extensions_config.json
 coverage.xml
 coverage/
 .deer-flow/
+.deer-flow.bak.*/
+backend/.deer-flow.bak.*/
 .claude/
 skills/custom/*
 logs/
@@ -60,3 +63,6 @@ config.yaml.bak
 /frontend/playwright-report/
 .gstack/
 .worktrees
+
+# Nested external project (separate git repo)
+skillhub/

@@ -32,7 +32,7 @@ cp .env.example .env
 # Start development server
 pnpm dev
 
-# The app will be available at http://localhost:3000
+# The app will be available at http://localhost:3110
 ```
 
 ### Build & Test
@@ -69,11 +69,32 @@ pnpm start
 ## Site Map
 
 ```
-├── /                    # Landing page
-├── /chats               # Chat list
-├── /chats/new           # New chat page
-└── /chats/[thread_id]   # A specific chat page
+├── /                              # Landing page
+├── /chats                         # Chat list
+├── /chats/new                     # New chat page
+├── /chats/[thread_id]             # A specific chat page
+│
+├── /login                         # OIDC provider buttons (M7 A1)
+├── /logout                        # Sign-out bridge
+├── /auth/oidc/[provider]/callback # OIDC return target
+├── /forbidden                     # 403 page rendered by RequirePermission
+│
+└── /admin/...                     # Identity admin (gated by middleware.ts)
+    ├── profile                    # Basic + my tokens + my sessions tabs
+    ├── tenants                    # platform_admin only — list & detail
+    ├── users                      # tenant_owner — list, filter, create
+    ├── roles                      # 5 built-in roles, read-only
+    ├── workspaces                 # list + member management
+    │   └── [id]/members           # add / remove / change role
+    ├── tokens                     # tenant tokens — issue & revoke
+    └── audit                      # filter, drawer, CSV export
 ```
+
+The `/admin/*` routes ship behind `ENABLE_IDENTITY=true` on the backend.
+With the flag off, the UI middleware still works (it short-circuits when
+no `deerflow_session` cookie is present), but the backend returns 404
+on `/api/me` so users land on `/login` and stay there. See
+[../docs/UPGRADE_v2.md](../docs/UPGRADE_v2.md) for the rollout path.
 
 ## Configuration
 
@@ -83,7 +104,7 @@ Key environment variables (see `.env.example` for full list):
 
 ```bash
 # Backend API URLs (optional, uses nginx proxy by default)
-NEXT_PUBLIC_BACKEND_BASE_URL="http://localhost:8001"
+NEXT_PUBLIC_BACKEND_BASE_URL="http://localhost:8100"
 # LangGraph API URLs (optional, uses nginx proxy by default)
 NEXT_PUBLIC_LANGGRAPH_BASE_URL="http://localhost:2024"
 ```
@@ -107,8 +128,15 @@ src/
 ├── core/                   # Core business logic
 │   ├── api/                # API client & data fetching
 │   ├── artifacts/          # Artifact management
-│   ├── config/              # App configuration
-│   ├── i18n/               # Internationalization
+│   ├── config/             # App configuration
+│   ├── i18n/               # Internationalization (en-US, zh-CN)
+│   ├── identity/           # /api/me, /api/auth, /api/admin wrappers (M7)
+│   │   ├── api.ts          # Typed REST client wrappers
+│   │   ├── components/     # AdminSidebar, TenantSwitcher, RequirePermission, …
+│   │   ├── fetcher.ts      # Session-expiry aware fetch helper
+│   │   ├── hooks.ts        # useIdentity, useHasPermission, list+mutation hooks
+│   │   ├── query-keys.ts   # TanStack Query keys
+│   │   └── types.ts        # Backend response shapes mirrored 1:1
 │   ├── mcp/                # MCP integration
 │   ├── messages/           # Message handling
 │   ├── models/             # Data models & types
@@ -146,6 +174,38 @@ src/
 - Turbopack enabled by default in development for faster builds
 - Environment validation can be skipped with `SKIP_ENV_VALIDATION=1` (useful for Docker)
 - Backend API URLs are optional; nginx proxy is used by default in development
+
+## Identity admin surface (M7 A)
+
+When the backend runs with `ENABLE_IDENTITY=true`, the frontend exposes an
+admin shell under `/admin/*`. Routing rules:
+
+- **`middleware.ts`** redirects every `/admin/*` request without a
+  `deerflow_session` cookie to `/login?next=…`.
+- **`<RequirePermission>`** wraps each admin page body and renders the
+  `/forbidden` UI if the caller lacks the page's required permission tag.
+- **Sidebar** items hide themselves entirely when their `requires` tag
+  isn't on `useIdentity().permissions` (or, for `Tenants`, when the caller
+  isn't a `platform_admin`).
+
+The identity client (`src/core/identity/`) speaks directly to the
+backend routes documented in
+[../docs/superpowers/specs/archive/2026-04-21-deerflow-identity-foundation-design.md](../docs/superpowers/specs/archive/2026-04-21-deerflow-identity-foundation-design.md):
+
+| Page                      | Backend routes consumed                                                |
+|---------------------------|------------------------------------------------------------------------|
+| `/admin/profile`          | `/api/me`, `/api/me/tokens`, `/api/me/sessions`                        |
+| `/admin/tenants`          | `/api/admin/tenants[/:id]`                                             |
+| `/admin/users`            | `GET/POST /api/tenants/{tid}/users`                                    |
+| `/admin/workspaces/[id]/members` | `GET/POST/PATCH/DELETE /api/tenants/{tid}/workspaces/{wid}/members` |
+| `/admin/tokens`           | `GET/POST /api/tenants/{tid}/tokens`, `DELETE …/{id}`                  |
+| `/admin/audit`            | `GET /api/tenants/{tid}/audit{,/export}`                               |
+| `/admin/roles`            | `/api/roles`                                                           |
+
+E2E coverage lives at `tests/e2e/identity/` with shared fixtures in
+`fixtures/mock-backend.ts` (`mockIdentity`, `mockAdmin`, `mockWrites`).
+Each spec mocks the backend through `page.route()` so no live PG/Redis
+is needed — run with `pnpm test:e2e --grep identity`.
 
 ## License
 

@@ -13,7 +13,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 DOCKER_DIR="$PROJECT_ROOT/docker"
 
 # Docker Compose command with project name
-COMPOSE_CMD="docker compose -p deer-flow-dev -f docker-compose-dev.yaml"
+COMPOSE_CMD="docker compose --env-file ../.env -p deer-flow-dev -f docker-compose-dev.yaml"
 
 detect_sandbox_mode() {
     local config_file="$PROJECT_ROOT/config.yaml"
@@ -82,6 +82,151 @@ docker_available() {
     fi
 
     return 0
+}
+
+env_file_value() {
+    local key="$1"
+
+    if [ ! -f "$PROJECT_ROOT/.env" ]; then
+        return 0
+    fi
+
+    awk -F= -v key="$key" '
+        $1 == key {
+            sub(/\r$/, "", $2)
+            print $2
+            exit
+        }
+    ' "$PROJECT_ROOT/.env"
+}
+
+is_truthy() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+identity_enabled() {
+    local raw="${ENABLE_IDENTITY:-$(env_file_value ENABLE_IDENTITY)}"
+    is_truthy "$raw"
+}
+
+append_env_default() {
+    local key="$1"
+    local value="$2"
+
+    if grep -Eq "^${key}=" "$PROJECT_ROOT/.env" 2>/dev/null; then
+        return 0
+    fi
+
+    printf "%s=%s\n" "$key" "$value" >> "$PROJECT_ROOT/.env"
+    echo -e "${BLUE}Added ${key} to .env${NC}"
+}
+
+ensure_identity_env_defaults() {
+    append_env_default "ENABLE_IDENTITY" "true"
+    append_env_default "DEERFLOW_DATABASE_URL" "postgresql+asyncpg://deerflow:deerflow@postgres:5432/deerflow"
+    append_env_default "DEERFLOW_REDIS_URL" "redis://redis:6379/0"
+    append_env_default "DEERFLOW_BOOTSTRAP_ADMIN_EMAIL" "admin@local.deerflow"
+    append_env_default "DEERFLOW_BOOTSTRAP_ADMIN_PASSWORD" "DeerFlow123!"
+    append_env_default "DEERFLOW_BOOTSTRAP_PASSWORD_TOKEN" "deerflow-bootstrap-local"
+    append_env_default "DEERFLOW_COOKIE_SECURE" "false"
+    append_env_default "DEERFLOW_INTERNAL_SIGNING_KEY" "deerflow-local-hmac-key"
+    append_env_default "POSTGRES_DB" "deerflow"
+    append_env_default "POSTGRES_USER" "deerflow"
+    append_env_default "POSTGRES_PASSWORD" "deerflow"
+    append_env_default "POSTGRES_PORT" "5432"
+    append_env_default "REDIS_PORT" "6379"
+}
+
+ensure_identity_config_file() {
+    mkdir -p "$PROJECT_ROOT/config"
+
+    if [ ! -f "$PROJECT_ROOT/config/identity.yaml" ]; then
+        cat > "$PROJECT_ROOT/config/identity.yaml" <<'EOF'
+oidc:
+  providers: {}
+EOF
+        echo -e "${BLUE}Created config/identity.yaml with empty OIDC providers${NC}"
+    fi
+}
+
+wait_for_service_ready() {
+    local service="$1"
+    local status=""
+    local container_id=""
+    local attempt=0
+    local max_attempts=60
+
+    echo -e "${BLUE}Waiting for ${service} to become ready...${NC}"
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        container_id=$(cd "$DOCKER_DIR" && $COMPOSE_CMD ps -q "$service")
+        if [ -n "$container_id" ]; then
+            status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || true)
+            if [ "$status" = "healthy" ] || [ "$status" = "running" ]; then
+                echo -e "${GREEN}✓ ${service} is ${status}${NC}"
+                return 0
+            fi
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    echo -e "${YELLOW}✗ Timed out waiting for ${service}${NC}"
+    return 1
+}
+
+run_identity_setup() {
+    echo -e "${BLUE}Preparing identity database schema and JWT keys...${NC}"
+    cd "$DOCKER_DIR" && $COMPOSE_CMD run --rm --no-deps gateway sh -lc "
+        cd backend &&
+        (uv sync || (echo '[identity] uv sync failed; recreating .venv and retrying once' && uv venv --allow-existing .venv && uv sync)) &&
+        make db-upgrade &&
+        make identity-bootstrap &&
+        make identity-keys &&
+        PYTHONPATH=. uv run python - <<'PY'
+import os
+from sqlalchemy import select
+
+from app.gateway.identity.auth.passwords import hash_password
+from app.gateway.identity.db import create_engine_and_sessionmaker
+from app.gateway.identity.models.user import User
+from app.gateway.identity.settings import get_identity_settings
+
+settings = get_identity_settings()
+password = os.environ.get('DEERFLOW_BOOTSTRAP_ADMIN_PASSWORD', '').strip()
+email = (settings.bootstrap_admin_email or '').strip().lower()
+
+if not password or not email:
+    print('identity bootstrap password skipped: missing admin email or password')
+    raise SystemExit(0)
+
+async def main():
+    engine, maker = create_engine_and_sessionmaker(settings.database_url)
+    try:
+        async with maker() as session:
+            user = (await session.execute(select(User).where(User.email == email))).scalar_one_or_none()
+            if user is None:
+                print(f'identity bootstrap password skipped: user {email!r} not found')
+                return
+            if user.password_hash:
+                print(f'identity bootstrap password already initialized for {email}')
+                return
+            user.password_hash = hash_password(password)
+            await session.commit()
+            print(f'initialized bootstrap password for {email}')
+    finally:
+        await engine.dispose()
+
+import asyncio
+asyncio.run(main())
+PY
+    "
 }
 
 # Initialize: pre-pull the sandbox image so first Pod startup is fast
@@ -153,6 +298,7 @@ start() {
     local sandbox_mode
     local services
     local gateway_mode=false
+    local identity_mode=false
 
     # Check for --gateway flag
     for arg in "$@"; do
@@ -232,10 +378,45 @@ start() {
         fi
     fi
 
+    if [ ! -f "$PROJECT_ROOT/.env" ]; then
+        if [ -f "$PROJECT_ROOT/.env.example" ]; then
+            cp "$PROJECT_ROOT/.env.example" "$PROJECT_ROOT/.env"
+            echo -e "${BLUE}Created .env from .env.example${NC}"
+        else
+            : > "$PROJECT_ROOT/.env"
+            echo -e "${BLUE}Created empty .env${NC}"
+        fi
+    fi
+
+    if [ ! -f "$PROJECT_ROOT/frontend/.env" ]; then
+        if [ -f "$PROJECT_ROOT/frontend/.env.example" ]; then
+            cp "$PROJECT_ROOT/frontend/.env.example" "$PROJECT_ROOT/frontend/.env"
+            echo -e "${BLUE}Created frontend/.env from frontend/.env.example${NC}"
+        else
+            mkdir -p "$PROJECT_ROOT/frontend"
+            : > "$PROJECT_ROOT/frontend/.env"
+            echo -e "${BLUE}Created empty frontend/.env${NC}"
+        fi
+    fi
+
+    if identity_enabled; then
+        identity_mode=true
+        ensure_identity_env_defaults
+        ensure_identity_config_file
+    fi
+
     # Set nginx routing for gateway mode (envsubst in nginx container)
     if $gateway_mode; then
         export LANGGRAPH_UPSTREAM=gateway:8001
         export LANGGRAPH_REWRITE=/api/
+    fi
+
+    if $identity_mode; then
+        echo -e "${BLUE}Identity mode enabled — starting Postgres and Redis first${NC}"
+        cd "$DOCKER_DIR" && $COMPOSE_CMD up -d --remove-orphans postgres redis
+        wait_for_service_ready postgres
+        wait_for_service_ready redis
+        run_identity_setup
     fi
 
     echo "Building and starting containers..."
@@ -254,6 +435,13 @@ start() {
         echo "  🤖 LangGraph:   http://localhost:2026/api/langgraph/*"
     fi
     echo ""
+    if $identity_mode; then
+        echo "  🔐 Identity:    enabled"
+        echo "  👤 Admin email: $(env_file_value DEERFLOW_BOOTSTRAP_ADMIN_EMAIL)"
+        echo "  🔑 Password:    $(env_file_value DEERFLOW_BOOTSTRAP_ADMIN_PASSWORD)"
+        echo "  🔁 Reset token: $(env_file_value DEERFLOW_BOOTSTRAP_PASSWORD_TOKEN)"
+        echo ""
+    fi
     echo "  📋 View logs: make docker-logs"
     echo "  🛑 Stop:      make docker-stop"
     echo ""

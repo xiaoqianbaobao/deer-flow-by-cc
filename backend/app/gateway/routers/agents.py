@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from deerflow.config.agents_api_config import get_agents_api_config
 from deerflow.config.agents_config import AgentConfig, list_custom_agents, load_agent_config, load_agent_soul
+from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import get_paths
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,8 @@ class AgentResponse(BaseModel):
     description: str = Field(default="", description="Agent description")
     model: str | None = Field(default=None, description="Optional model override")
     tool_groups: list[str] | None = Field(default=None, description="Optional tool group whitelist")
-    skills: list[str] | None = Field(default=None, description="Optional skill whitelist (None=all, []=none)")
+    skills: list[str] | None = Field(default=None, description="Skill list, supports 'name@version' format (None=all, []=none)")
+    org_key_env: str | None = Field(default=None, description="Env var name holding the org API key")
     soul: str | None = Field(default=None, description="SOUL.md content")
 
 
@@ -35,6 +37,18 @@ class AgentsListResponse(BaseModel):
     agents: list[AgentResponse]
 
 
+class ToolGroupResponse(BaseModel):
+    """Response model for a single tool group."""
+
+    name: str = Field(..., description="Tool group name")
+
+
+class ToolGroupsListResponse(BaseModel):
+    """Response model for listing all tool groups defined in config.yaml."""
+
+    tool_groups: list[ToolGroupResponse]
+
+
 class AgentCreateRequest(BaseModel):
     """Request body for creating a custom agent."""
 
@@ -42,7 +56,8 @@ class AgentCreateRequest(BaseModel):
     description: str = Field(default="", description="Agent description")
     model: str | None = Field(default=None, description="Optional model override")
     tool_groups: list[str] | None = Field(default=None, description="Optional tool group whitelist")
-    skills: list[str] | None = Field(default=None, description="Optional skill whitelist (None=all enabled, []=none)")
+    skills: list[str] | None = Field(default=None, description="Skill list, supports 'name@version' format (None=all enabled, []=none)")
+    org_key_env: str | None = Field(default=None, description="Env var name holding the org API key")
     soul: str = Field(default="", description="SOUL.md content — agent personality and behavioral guardrails")
 
 
@@ -52,7 +67,8 @@ class AgentUpdateRequest(BaseModel):
     description: str | None = Field(default=None, description="Updated description")
     model: str | None = Field(default=None, description="Updated model override")
     tool_groups: list[str] | None = Field(default=None, description="Updated tool group whitelist")
-    skills: list[str] | None = Field(default=None, description="Updated skill whitelist (None=all, []=none)")
+    skills: list[str] | None = Field(default=None, description="Updated skill list, supports 'name@version' format (None=all, []=none)")
+    org_key_env: str | None = Field(default=None, description="Updated org key env var name")
     soul: str | None = Field(default=None, description="Updated SOUL.md content")
 
 
@@ -98,7 +114,26 @@ def _agent_config_to_response(agent_cfg: AgentConfig, include_soul: bool = False
         model=agent_cfg.model,
         tool_groups=agent_cfg.tool_groups,
         skills=agent_cfg.skills,
+        org_key_env=agent_cfg.org_key_env,
         soul=soul,
+    )
+
+
+@router.get(
+    "/tool-groups",
+    response_model=ToolGroupsListResponse,
+    summary="List Tool Groups",
+    description="List all tool groups defined in config.yaml.",
+)
+async def list_tool_groups() -> ToolGroupsListResponse:
+    """Return the names of every tool group from the active config.yaml.
+
+    Used by the agent edit page to populate the tool-groups multi-select.
+    """
+    _require_agents_api_enabled()
+    cfg = get_app_config()
+    return ToolGroupsListResponse(
+        tool_groups=[ToolGroupResponse(name=g.name) for g in cfg.tool_groups]
     )
 
 
@@ -221,6 +256,8 @@ async def create_agent_endpoint(request: AgentCreateRequest) -> AgentResponse:
             config_data["tool_groups"] = request.tool_groups
         if request.skills is not None:
             config_data["skills"] = request.skills
+        if request.org_key_env is not None:
+            config_data["org_key_env"] = request.org_key_env
 
         config_file = agent_dir / "config.yaml"
         with open(config_file, "w", encoding="utf-8") as f:
@@ -276,11 +313,11 @@ async def update_agent(name: str, request: AgentUpdateRequest) -> AgentResponse:
     agent_dir = get_paths().agent_dir(name)
 
     try:
-        # Update config if any config fields changed
+        # Update config if any config fields changed.
         # Use model_fields_set to distinguish "field omitted" from "explicitly set to null".
         # This is critical for skills where None means "inherit all" (not "don't change").
         fields_set = request.model_fields_set
-        config_changed = bool(fields_set & {"description", "model", "tool_groups", "skills"})
+        config_changed = bool(fields_set & {"description", "model", "tool_groups", "skills", "org_key_env"})
 
         if config_changed:
             updated: dict = {
@@ -296,12 +333,14 @@ async def update_agent(name: str, request: AgentUpdateRequest) -> AgentResponse:
                 updated["tool_groups"] = new_tool_groups
 
             # skills: None = inherit all, [] = no skills, ["a","b"] = whitelist
-            if "skills" in fields_set:
-                new_skills = request.skills
-            else:
-                new_skills = agent_cfg.skills
+            new_skills = request.skills if "skills" in fields_set else agent_cfg.skills
             if new_skills is not None:
                 updated["skills"] = new_skills
+
+            new_org_key_env = request.org_key_env if "org_key_env" in fields_set else agent_cfg.org_key_env
+            if new_org_key_env is not None:
+                updated["org_key_env"] = new_org_key_env
+
 
             config_file = agent_dir / "config.yaml"
             with open(config_file, "w", encoding="utf-8") as f:

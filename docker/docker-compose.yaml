@@ -56,6 +56,7 @@ services:
     container_name: deer-flow-frontend
     environment:
       - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
+      - NEXT_PUBLIC_ENABLE_IDENTITY=${ENABLE_IDENTITY:-false}
       - DEER_FLOW_INTERNAL_GATEWAY_BASE_URL=http://gateway:8001
       - DEER_FLOW_INTERNAL_LANGGRAPH_BASE_URL=http://langgraph:2024
     env_file:
@@ -77,6 +78,7 @@ services:
     command: sh -c "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers ${GATEWAY_WORKERS:-4}"
     volumes:
       - ${DEER_FLOW_CONFIG_PATH}:/app/backend/config.yaml:ro
+      - ../config:/app/config:ro
       - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:ro
       - ../skills:/app/skills:ro
       - ${DEER_FLOW_HOME}:/app/backend/.deer-flow
@@ -84,13 +86,13 @@ services:
       - ${DEER_FLOW_DOCKER_SOCKET}:/var/run/docker.sock
       # CLI auth directories for auto-auth (Claude Code + Codex CLI)
       - type: bind
-        source: ${HOME:?HOME must be set}/.claude
+        source: ~/.claude
         target: /root/.claude
         read_only: true
         bind:
           create_host_path: true
       - type: bind
-        source: ${HOME:?HOME must be set}/.codex
+        source: ~/.codex
         target: /root/.codex
         read_only: true
         bind:
@@ -99,6 +101,7 @@ services:
     environment:
       - CI=true
       - DEER_FLOW_HOME=/app/backend/.deer-flow
+      - DEERFLOW_IDENTITY_CONFIG=/app/config/identity.yaml
       - DEER_FLOW_CONFIG_PATH=/app/backend/config.yaml
       - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/backend/extensions_config.json
       - DEER_FLOW_CHANNELS_LANGGRAPH_URL=${DEER_FLOW_CHANNELS_LANGGRAPH_URL:-http://langgraph:2024}
@@ -130,6 +133,7 @@ services:
     command: sh -c 'cd /app/backend && args="--no-browser --no-reload --host 0.0.0.0 --port 2024 --n-jobs-per-worker $${LANGGRAPH_JOBS_PER_WORKER:-10}" && if [ "$${LANGGRAPH_ALLOW_BLOCKING:-0}" = "1" ]; then args="$$args --allow-blocking"; fi && uv run langgraph dev $$args'
     volumes:
       - ${DEER_FLOW_CONFIG_PATH}:/app/backend/config.yaml:ro
+      - ../config:/app/config:ro
       - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:ro
       - ${DEER_FLOW_HOME}:/app/backend/.deer-flow
       - ../skills:/app/skills:ro
@@ -138,13 +142,13 @@ services:
       - ${DEER_FLOW_DOCKER_SOCKET}:/var/run/docker.sock
       # CLI auth directories for auto-auth (Claude Code + Codex CLI)
       - type: bind
-        source: ${HOME:?HOME must be set}/.claude
+        source: ~/.claude
         target: /root/.claude
         read_only: true
         bind:
           create_host_path: true
       - type: bind
-        source: ${HOME:?HOME must be set}/.codex
+        source: ~/.codex
         target: /root/.codex
         read_only: true
         bind:
@@ -152,6 +156,7 @@ services:
     environment:
       - CI=true
       - DEER_FLOW_HOME=/app/backend/.deer-flow
+      - DEERFLOW_IDENTITY_CONFIG=/app/config/identity.yaml
       - DEER_FLOW_CONFIG_PATH=/app/backend/config.yaml
       - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/backend/extensions_config.json
       - DEER_FLOW_HOST_BASE_DIR=${DEER_FLOW_HOME}
@@ -197,6 +202,49 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
+
+  # ── Postgres (identity subsystem, optional) ────────────────────────────────
+  # Only needed when ENABLE_IDENTITY=true. Off by default so existing
+  # deployments keep working unchanged.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-deerflow}
+      POSTGRES_USER: ${POSTGRES_USER:-deerflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deerflow}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - deerflow_postgres:/var/lib/postgresql/data
+    networks:
+      - deer-flow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deerflow} -d ${POSTGRES_DB:-deerflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis (identity subsystem, optional) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - deerflow_redis:/data
+    networks:
+      - deer-flow
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
 networks:
   deer-flow:
     driver: bridge
+
+volumes:
+  deerflow_postgres:
+  deerflow_redis:

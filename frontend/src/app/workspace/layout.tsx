@@ -1,10 +1,15 @@
 import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 import { Toaster } from "sonner";
 
 import { QueryClientProvider } from "@/components/query-client-provider";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { CommandPalette } from "@/components/workspace/command-palette";
 import { WorkspaceSidebar } from "@/components/workspace/workspace-sidebar";
+
+const COOKIE_NAME =
+  process.env.NEXT_PUBLIC_DEERFLOW_COOKIE_NAME ?? "deerflow_session";
+const IDENTITY_ENABLED = process.env.NEXT_PUBLIC_ENABLE_IDENTITY === "true";
 
 function parseSidebarOpenCookie(
   value: string | undefined,
@@ -18,6 +23,11 @@ export default async function WorkspaceLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   const cookieStore = await cookies();
+
+  if (IDENTITY_ENABLED && !cookieStore.get(COOKIE_NAME)?.value) {
+    redirect("/login?next=/workspace");
+  }
+
   const initialSidebarOpen = parseSidebarOpenCookie(
     cookieStore.get("sidebar_state")?.value,
   );

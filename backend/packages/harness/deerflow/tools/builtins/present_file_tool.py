@@ -7,6 +7,7 @@ from langgraph.config import get_config
 from langgraph.types import Command
 from langgraph.typing import ContextT
 
+from deerflow.agents.middlewares._identity import extract_tenant_ids
 from deerflow.agents.thread_state import ThreadState
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 
@@ -65,7 +66,11 @@ def _normalize_presented_filepath(
     virtual_prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
 
     if stripped == virtual_prefix or stripped.startswith(virtual_prefix + "/"):
-        actual_path = get_paths().resolve_virtual_path(thread_id, filepath)
+        # Forward identity (if populated by ThreadDataMiddleware) so the
+        # resolver routes under the tenant-stratified user-data directory.
+        identity = runtime.state.get("identity") if hasattr(runtime.state, "get") else None
+        tenant_id, workspace_id = extract_tenant_ids(identity)
+        actual_path = get_paths().resolve_virtual_path(thread_id, filepath, tenant_id=tenant_id, workspace_id=workspace_id)
     else:
         actual_path = Path(filepath).expanduser().resolve()
 

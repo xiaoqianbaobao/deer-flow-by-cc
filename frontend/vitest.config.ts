@@ -8,7 +8,11 @@ export default defineConfig({
       "@": resolve(__dirname, "src"),
     },
   },
+  esbuild: {
+    jsx: "automatic",
+  },
   test: {
-    include: ["tests/unit/**/*.test.ts"],
+    include: ["tests/unit/**/*.test.{ts,tsx}"],
+    environment: "jsdom",
   },
 });

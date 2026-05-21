@@ -113,7 +113,7 @@ class TestResolveAttachments:
 
         mock_paths = MagicMock()
         mock_paths.resolve_virtual_path.return_value = test_file
-        mock_paths.sandbox_outputs_dir.return_value = outputs_dir
+        mock_paths.resolve_sandbox_outputs_dir.return_value = outputs_dir
 
         with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
             result = _resolve_attachments(thread_id, ["/mnt/user-data/outputs/report.pdf"])
@@ -136,7 +136,7 @@ class TestResolveAttachments:
 
         mock_paths = MagicMock()
         mock_paths.resolve_virtual_path.return_value = img
-        mock_paths.sandbox_outputs_dir.return_value = outputs_dir
+        mock_paths.resolve_sandbox_outputs_dir.return_value = outputs_dir
 
         with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
             result = _resolve_attachments(thread_id, ["/mnt/user-data/outputs/chart.png"])
@@ -154,7 +154,7 @@ class TestResolveAttachments:
 
         mock_paths = MagicMock()
         mock_paths.resolve_virtual_path.return_value = outputs_dir / "nonexistent.txt"
-        mock_paths.sandbox_outputs_dir.return_value = outputs_dir
+        mock_paths.resolve_sandbox_outputs_dir.return_value = outputs_dir
 
         with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
             result = _resolve_attachments("t1", ["/mnt/user-data/outputs/nonexistent.txt"])
@@ -211,7 +211,7 @@ class TestResolveAttachments:
 
         mock_paths = MagicMock()
         mock_paths.resolve_virtual_path.return_value = escaped_file
-        mock_paths.sandbox_outputs_dir.return_value = outputs_dir
+        mock_paths.resolve_sandbox_outputs_dir.return_value = outputs_dir
 
         with patch("deerflow.config.paths.get_paths", return_value=mock_paths):
             result = _resolve_attachments(thread_id, ["/mnt/user-data/outputs/../uploads/stolen.txt"])
@@ -229,9 +229,9 @@ class TestResolveAttachments:
         good_file.write_text("a,b,c")
 
         mock_paths = MagicMock()
-        mock_paths.sandbox_outputs_dir.return_value = outputs_dir
+        mock_paths.resolve_sandbox_outputs_dir.return_value = outputs_dir
 
-        def resolve_side_effect(tid, vpath):
+        def resolve_side_effect(tid, vpath, *, tenant_id=None, workspace_id=None):
             if "data.csv" in vpath:
                 return good_file
             return tmp_path / "missing.txt"
@@ -458,3 +458,36 @@ class TestManagerArtifactResolution:
         result = _format_artifact_text(["/mnt/user-data/outputs/a.txt", "/mnt/user-data/outputs/b.txt"])
         assert "a.txt" in result
         assert "b.txt" in result
+
+
+class TestFeishuResolveUploadsDir:
+    """Pure-function test for the new helper that decides where Feishu writes
+    downloaded files. Covers both tenant-aware and legacy fallback paths."""
+
+    def test_with_tenant_returns_tenant_path(self, tmp_path):
+        from app.channels.feishu import FeishuChannel
+        from deerflow.config.paths import Paths
+
+        paths = Paths(base_dir=str(tmp_path))
+        with patch("app.channels.feishu.get_paths", return_value=paths):
+            ch = FeishuChannel.__new__(FeishuChannel)  # bypass __init__ (lark sdk side effects)
+            result = ch._resolve_uploads_dir("thread-z", tenant_id=2, workspace_id=3)
+
+        expected = paths.resolve_sandbox_uploads_dir(
+            "thread-z", tenant_id=2, workspace_id=3
+        ).resolve()
+        assert result == expected
+        assert result.is_dir()  # ensure_thread_dirs_for created it
+
+    def test_without_tenant_returns_legacy(self, tmp_path):
+        from app.channels.feishu import FeishuChannel
+        from deerflow.config.paths import Paths
+
+        paths = Paths(base_dir=str(tmp_path))
+        with patch("app.channels.feishu.get_paths", return_value=paths):
+            ch = FeishuChannel.__new__(FeishuChannel)
+            result = ch._resolve_uploads_dir("thread-z", tenant_id=None, workspace_id=None)
+
+        expected = paths.resolve_sandbox_uploads_dir("thread-z").resolve()
+        assert result == expected
+        assert result.is_dir()
