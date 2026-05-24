@@ -23,6 +23,7 @@ import { RequirePermission } from "@/core/identity/components/RequirePermission"
 import {
   useDeleteTenant,
   useHasPermission,
+  useSwitchTenant,
   useTenant,
   useUpdateTenant,
 } from "@/core/identity/hooks";
@@ -50,9 +51,11 @@ function Inner({ id }: { id: number }) {
   const { t } = useI18n();
   const { data, isLoading, isError } = useTenant(id);
   const [renameOpen, setRenameOpen] = useState(false);
+  const [manageError, setManageError] = useState<string | null>(null);
   const canUpdate = useHasPermission("tenant:update");
   const canDelete = useHasPermission("tenant:delete");
   const remove = useDeleteTenant();
+  const switchTenant = useSwitchTenant();
 
   if (isLoading) return <p className="p-6 text-muted-foreground">{t.admin.table.loading}</p>;
   if (isError || !data)
@@ -96,6 +99,51 @@ function Inner({ id }: { id: number }) {
           <code>/{data.slug}</code> · #{data.id}
         </p>
       </header>
+
+      <div className="mb-6 flex flex-wrap items-center gap-2">
+        <Button
+          variant="outline"
+          disabled={switchTenant.isPending}
+          onClick={async () => {
+            setManageError(null);
+            try {
+              await switchTenant.mutateAsync(data.id);
+              router.push("/admin/workspaces");
+            } catch (err) {
+              setManageError(
+                (err as Error)?.message ||
+                  "无法切换到该租户。请确认你是该租户成员（当前版本新建租户不会自动把创建者加入）。",
+              );
+            }
+          }}
+        >
+          {t.admin.nav.workspaces} →
+        </Button>
+        <Button
+          variant="outline"
+          disabled={switchTenant.isPending}
+          onClick={async () => {
+            setManageError(null);
+            try {
+              await switchTenant.mutateAsync(data.id);
+              router.push("/admin/users");
+            } catch (err) {
+              setManageError(
+                (err as Error)?.message ||
+                  "无法切换到该租户。请确认你是该租户成员（当前版本新建租户不会自动把创建者加入）。",
+              );
+            }
+          }}
+        >
+          {t.admin.nav.users} →
+        </Button>
+        {manageError && (
+          <span className="text-sm text-destructive" data-testid="tenant-manage-error">
+            {manageError}
+          </span>
+        )}
+      </div>
+
       <dl className="grid grid-cols-2 gap-4 text-sm">
         <div>
           <dt className="text-muted-foreground">{t.admin.table.colPlan}</dt>

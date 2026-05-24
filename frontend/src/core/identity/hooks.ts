@@ -201,7 +201,7 @@ export function useRoles() {
   return useQuery({
     queryKey: identityKeys.roles(),
     queryFn: () => identityApi.listRoles(),
-    staleTime: 5 * 60_000, // roles rarely change
+    staleTime: 0,
   });
 }
 

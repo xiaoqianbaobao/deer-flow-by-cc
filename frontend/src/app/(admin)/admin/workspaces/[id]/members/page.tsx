@@ -46,7 +46,7 @@ import {
 import { type RoleName, type WorkspaceMemberRow } from "@/core/identity/types";
 
 const PAGE_SIZE = 50;
-const WORKSPACE_ROLES: RoleName[] = ["workspace_admin", "member", "viewer"];
+const WORKSPACE_ROLES: RoleName[] = ["workspace_admin", "workspace_member", "member", "viewer"];
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -231,7 +231,7 @@ function AddMemberDialog({
 }) {
   const { t } = useI18n();
   const [userIdRaw, setUserIdRaw] = useState("");
-  const [role, setRole] = useState<RoleName>("member");
+  const [role, setRole] = useState<RoleName>("workspace_member");
   const add = useAddWorkspaceMember(tenantId, wsId);
 
   return (

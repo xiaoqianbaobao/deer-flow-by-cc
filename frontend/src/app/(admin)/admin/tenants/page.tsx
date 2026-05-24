@@ -3,6 +3,7 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 
@@ -26,7 +27,7 @@ import {
 } from "@/components/ui/table";
 import { useI18n } from "@/core/i18n/hooks";
 import { RequirePermission } from "@/core/identity/components/RequirePermission";
-import { useCreateTenant, useTenants } from "@/core/identity/hooks";
+import { useCreateTenant, useSwitchTenant, useTenants } from "@/core/identity/hooks";
 import {
   type CreateTenantFields,
   createTenantSchema,
@@ -43,10 +44,13 @@ export default function TenantsPage() {
 }
 
 function TenantsInner() {
+  const router = useRouter();
   const { t } = useI18n();
   const [q, setQ] = useState("");
   const [offset, setOffset] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
+  const [manageError, setManageError] = useState<string | null>(null);
+  const switchTenant = useSwitchTenant();
   const { data, isLoading, isError } = useTenants({
     q,
     offset,
@@ -83,6 +87,12 @@ function TenantsInner() {
         <CreateTenantDialog onClose={() => setCreateOpen(false)} />
       )}
 
+      {manageError && (
+        <p className="mb-3 text-sm text-destructive" data-testid="tenants-manage-error">
+          {manageError}
+        </p>
+      )}
+
       <Table>
         <TableHeader>
           <TableRow>
@@ -91,19 +101,20 @@ function TenantsInner() {
             <TableHead>{t.admin.table.colPlan}</TableHead>
             <TableHead>{t.admin.table.colStatus}</TableHead>
             <TableHead>{t.admin.table.colCreated}</TableHead>
+            <TableHead className="text-right">{t.admin.table.colAction}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {isLoading && (
             <TableRow>
-              <TableCell colSpan={5} className="text-muted-foreground">
+              <TableCell colSpan={6} className="text-muted-foreground">
                 {t.admin.table.loading}
               </TableCell>
             </TableRow>
           )}
           {isError && (
             <TableRow>
-              <TableCell colSpan={5} className="text-destructive">
+              <TableCell colSpan={6} className="text-destructive">
                 Failed to load tenants.
               </TableCell>
             </TableRow>
@@ -126,6 +137,27 @@ function TenantsInner() {
                   : t.admin.table.statusDisabled}
               </TableCell>
               <TableCell>{tenant.created_at?.slice(0, 10) ?? "—"}</TableCell>
+              <TableCell className="text-right">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={switchTenant.isPending}
+                  onClick={async () => {
+                    setManageError(null);
+                    try {
+                      await switchTenant.mutateAsync(tenant.id);
+                      router.push("/admin/workspaces");
+                    } catch (err) {
+                      setManageError(
+                        (err as Error)?.message ||
+                          "无法切换到该租户。请确认你是该租户成员（当前版本新建租户不会自动把创建者加入）。",
+                      );
+                    }
+                  }}
+                >
+                  {t.admin.nav.workspaces} →
+                </Button>
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>

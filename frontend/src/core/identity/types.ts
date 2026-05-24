@@ -6,6 +6,7 @@ export type RoleName =
   | "platform_admin"
   | "tenant_owner"
   | "workspace_admin"
+  | "workspace_member"
   | "member"
   | "viewer";
 
@@ -181,6 +182,8 @@ export interface CreateUserPayload {
   email: string;
   display_name?: string;
   initial_password?: string;
+  workspace_id?: number | null;
+  workspace_role?: string | null;
 }
 
 export interface AddWorkspaceMemberPayload {

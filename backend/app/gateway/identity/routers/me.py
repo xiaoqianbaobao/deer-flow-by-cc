@@ -14,7 +14,7 @@ from app.gateway.identity.auth.api_token import (
 )
 from app.gateway.identity.auth.dependencies import require_authenticated
 from app.gateway.identity.auth.identity import Identity
-from app.gateway.identity.auth.identity_factory import build_identity_for_user
+from app.gateway.identity.auth.identity_factory import build_identity_for_user, ensure_workspace_member
 from app.gateway.identity.auth.passwords import hash_password, verify_password
 from app.gateway.identity.auth.runtime import get_runtime
 from app.gateway.identity.models.tenant import Tenant, Workspace
@@ -163,6 +163,11 @@ async def switch_tenant(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "not a member of this tenant")
         tenant = (await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))).scalar_one()
         ws = (await db.execute(select(Workspace).where(Workspace.tenant_id == tenant.id).order_by(Workspace.slug))).scalars().first()
+        if ws is None:
+            ws = Workspace(tenant_id=tenant.id, slug="default", name="Default", created_by=identity.user_id)
+            db.add(ws)
+            await db.flush()
+        await ensure_workspace_member(db, user_id=identity.user_id, workspace_id=ws.id)
         user = (await db.execute(select(User).where(User.id == identity.user_id))).scalar_one()
         new_identity = await build_identity_for_user(db, user, tenant, ws)
 

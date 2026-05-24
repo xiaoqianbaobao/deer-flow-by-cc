@@ -79,6 +79,11 @@ async def resolve_active_tenant(
 
     if tenant is not None:
         ws = (await session.execute(select(Workspace).where(Workspace.tenant_id == tenant.id).order_by(Workspace.slug))).scalars().first()
+        if ws is None:
+            ws = Workspace(tenant_id=tenant.id, slug="default", name="Default", created_by=user.id)
+            session.add(ws)
+            await session.flush()
+        await ensure_workspace_member(session, user_id=user.id, workspace_id=ws.id)
         return tenant, ws
 
     if not auto_provision:
@@ -101,6 +106,42 @@ async def resolve_active_tenant(
     session.add(WorkspaceMember(user_id=user.id, workspace_id=ws.id, role_id=ws_admin.id))
     await session.flush()
     return tenant, ws
+
+
+async def ensure_workspace_member(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    workspace_id: int,
+    role_key: str = "workspace_member",
+) -> None:
+    existing = (
+        await session.execute(
+            select(WorkspaceMember).where(
+                WorkspaceMember.user_id == user_id,
+                WorkspaceMember.workspace_id == workspace_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+
+    role = (
+        await session.execute(
+            select(Role).where(Role.role_key == role_key, Role.scope == "workspace")
+        )
+    ).scalar_one_or_none()
+    if role is None and role_key != "member":
+        role = (
+            await session.execute(
+                select(Role).where(Role.role_key == "member", Role.scope == "workspace")
+            )
+        ).scalar_one_or_none()
+    if role is None:
+        return
+
+    session.add(WorkspaceMember(user_id=user_id, workspace_id=workspace_id, role_id=role.id))
+    await session.flush()
 
 
 async def build_identity_for_user(

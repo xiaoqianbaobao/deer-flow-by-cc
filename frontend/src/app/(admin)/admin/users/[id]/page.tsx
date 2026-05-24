@@ -18,7 +18,7 @@ import {
 } from "@/core/identity/hooks";
 import type { RoleName } from "@/core/identity/types";
 
-const WORKSPACE_ROLES: RoleName[] = ["workspace_admin", "member", "viewer"];
+const WORKSPACE_ROLES: RoleName[] = ["workspace_admin", "workspace_member", "member", "viewer"];
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -40,7 +40,7 @@ function Inner({ userId }: { userId: number }) {
   const { data, isLoading, isError } = useUser(tid, userId);
   const { data: workspaceData } = useWorkspaces(tid, { offset: 0, limit: 200 });
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<number>();
-  const [selectedRole, setSelectedRole] = useState<RoleName>("member");
+  const [selectedRole, setSelectedRole] = useState<RoleName>("workspace_member");
 
   useEffect(() => {
     if (selectedWorkspaceId) return;

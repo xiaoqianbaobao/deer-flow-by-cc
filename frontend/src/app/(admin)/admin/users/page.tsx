@@ -4,7 +4,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { PlusIcon } from "lucide-react";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,7 @@ import {
   useCreateUser,
   useHasPermission,
   useIdentity,
+  useWorkspaces,
   useUsers,
 } from "@/core/identity/hooks";
 import {
@@ -185,7 +186,19 @@ function CreateUserDialog({
     handleSubmit,
     formState: { errors, isSubmitting },
     setError,
+    setValue,
+    watch,
   } = useForm<CreateUserFields>({ resolver: zodResolver(createUserSchema) });
+  const { data: workspaces } = useWorkspaces(tenantId, { offset: 0, limit: 200 });
+  const selectedWorkspaceId = watch("workspace_id");
+
+  useEffect(() => {
+    if (selectedWorkspaceId) return;
+    const first = workspaces?.items?.[0];
+    if (!first) return;
+    setValue("workspace_id", first.id);
+    setValue("workspace_role", "workspace_member");
+  }, [selectedWorkspaceId, setValue, workspaces?.items]);
 
   const onSubmit = async (data: CreateUserFields) => {
     try {
@@ -197,6 +210,8 @@ function CreateUserDialog({
           initialPassword && initialPassword.length > 0
             ? initialPassword
             : undefined,
+        workspace_id: data.workspace_id ?? undefined,
+        workspace_role: data.workspace_role ?? undefined,
       });
       onClose();
     } catch {
@@ -257,6 +272,37 @@ function CreateUserDialog({
                 {errors.initial_password.message}
               </p>
             )}
+          </div>
+          <div className="grid gap-1 text-sm">
+            <label htmlFor="users-create-workspace">Workspace</label>
+            <select
+              id="users-create-workspace"
+              aria-label="Workspace"
+              className="h-9 rounded-md border bg-background px-3 text-sm"
+              {...register("workspace_id", { valueAsNumber: true })}
+              data-testid="users-create-workspace"
+            >
+              {(workspaces?.items ?? []).map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="grid gap-1 text-sm">
+            <label htmlFor="users-create-workspace-role">Workspace role</label>
+            <select
+              id="users-create-workspace-role"
+              aria-label="Workspace role"
+              className="h-9 rounded-md border bg-background px-3 text-sm"
+              {...register("workspace_role")}
+              data-testid="users-create-workspace-role"
+            >
+              <option value="workspace_member">workspace_member</option>
+              <option value="member">member</option>
+              <option value="viewer">viewer</option>
+              <option value="workspace_admin">workspace_admin</option>
+            </select>
           </div>
           {errors.root && (
             <p className="text-sm text-red-600" role="alert">

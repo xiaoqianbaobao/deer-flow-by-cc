@@ -145,5 +145,12 @@ export async function identityFetch<T>(
     });
   }
 
-  return (await resp.json()) as T;
+  if (resp.status === 204) {
+    return undefined as T;
+  }
+  const text = await resp.text().catch(() => "");
+  if (!text) {
+    return undefined as T;
+  }
+  return JSON.parse(text) as T;
 }

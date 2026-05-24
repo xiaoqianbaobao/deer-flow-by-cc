@@ -43,6 +43,8 @@ export const createUserSchema = z.object({
       message: "Initial password must be at least 8 characters",
     })
     .optional(),
+  workspace_id: z.number().int().positive().optional(),
+  workspace_role: z.enum(["workspace_admin", "workspace_member", "member", "viewer"]).optional(),
 });
 export type CreateUserFields = z.infer<typeof createUserSchema>;
 
@@ -55,7 +57,7 @@ export type CreateTenantTokenFields = z.infer<typeof createTenantTokenSchema>;
 
 export const addWorkspaceMemberSchema = z.object({
   user_id: z.number({ required_error: "User id is required" }).int().positive("Must be a positive integer"),
-  role: z.enum(["workspace_admin", "member", "viewer"]),
+  role: z.enum(["workspace_admin", "workspace_member", "member", "viewer"]),
 });
 export type AddWorkspaceMemberFields = z.infer<typeof addWorkspaceMemberSchema>;
 

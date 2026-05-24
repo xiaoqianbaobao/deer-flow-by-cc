@@ -27,6 +27,7 @@ from app.gateway.identity.models import (
     RegistrationCode,
     Role,
     Tenant,
+    UserRole,
     User,
     Workspace,
     WorkspaceMember,
@@ -45,6 +46,8 @@ class CreateUserIn(BaseModel):
     email: str
     display_name: str | None = None
     initial_password: str | None = None
+    workspace_id: int | None = None
+    workspace_role: str | None = None
 
     @field_validator("email")
     @classmethod
@@ -202,6 +205,56 @@ async def create_user(
         )
 
     session.add(Membership(user_id=user.id, tenant_id=tid))
+    await session.flush()
+
+    ws = None
+    if body.workspace_id:
+        ws = (
+            await session.execute(
+                select(Workspace).where(
+                    Workspace.id == body.workspace_id,
+                    Workspace.tenant_id == tid,
+                )
+            )
+        ).scalar_one_or_none()
+        if ws is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "workspace not found")
+    else:
+        ws = (
+            await session.execute(
+                select(Workspace).where(Workspace.tenant_id == tid).order_by(Workspace.slug)
+            )
+        ).scalars().first()
+        if ws is None:
+            ws = Workspace(tenant_id=tid, slug="default", name="Default", description="Default workspace")
+            session.add(ws)
+            await session.flush()
+
+    if ws is not None:
+        role_key = (body.workspace_role or "workspace_member").strip() if body.workspace_role else "workspace_member"
+        role = (
+            await session.execute(
+                select(Role).where(Role.role_key == role_key, Role.scope == "workspace")
+            )
+        ).scalar_one_or_none()
+        if role is None and role_key != "member":
+            role = (
+                await session.execute(
+                    select(Role).where(Role.role_key == "member", Role.scope == "workspace")
+                )
+            ).scalar_one_or_none()
+        if role is not None:
+            existing_wm = (
+                await session.execute(
+                    select(WorkspaceMember).where(
+                        WorkspaceMember.user_id == user.id,
+                        WorkspaceMember.workspace_id == ws.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing_wm is None:
+                session.add(WorkspaceMember(user_id=user.id, workspace_id=ws.id, role_id=role.id))
+
     await session.commit()
     return _user_out(user)
 
@@ -465,14 +518,28 @@ def _tenant_out(t: Tenant | Any) -> TenantOut:
 )
 async def create_tenant(
     body: CreateTenantIn,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> TenantOut:
     existing = (await session.execute(select(Tenant).where(Tenant.slug == body.slug))).scalar_one_or_none()
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "slug already in use")
-    tenant = Tenant(slug=body.slug, name=body.name)
+    caller = _caller_user_id(request)
+    tenant = Tenant(slug=body.slug, name=body.name, status=1, owner_id=caller, created_by=caller)
     session.add(tenant)
     await session.flush()
+    ws = Workspace(tenant_id=tenant.id, slug="default", name="Default", description="Default workspace", created_by=caller)
+    session.add(ws)
+    session.add(Membership(user_id=caller, tenant_id=tenant.id, status=1))
+    await session.flush()
+
+    tenant_owner = (await session.execute(select(Role).where(Role.role_key == "tenant_owner", Role.scope == "tenant"))).scalar_one_or_none()
+    if tenant_owner is not None:
+        session.add(UserRole(user_id=caller, tenant_id=tenant.id, role_id=tenant_owner.id))
+    ws_admin = (await session.execute(select(Role).where(Role.role_key == "workspace_admin", Role.scope == "workspace"))).scalar_one_or_none()
+    if ws_admin is not None:
+        session.add(WorkspaceMember(user_id=caller, workspace_id=ws.id, role_id=ws_admin.id))
+
     await session.commit()
     return _tenant_out(tenant)
 
