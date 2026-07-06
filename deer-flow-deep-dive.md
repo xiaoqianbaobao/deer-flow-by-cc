@@ -135,7 +135,7 @@ backend/packages/harness/deerflow/
 └── utils/                            ← 工具函数
 ```
 
-> **Gemini Prompt:** 用树形图展示 DeerFlow Harness 包的完整结构。根是 `deerflow/`，主要分支：agents/（含 checkpointer, memory, middlewares）、runtime/（含 main_loop, runs, store, stream_bridge）、sandbox/、subagents/、tools/、skills/、models/、mcp/、community/、config/。每个分支标注 2-3 个关键文件。
+![alt text](Gemini_Generated_Image_pbe8gvpbe8gvpbe8.png)
 
 ---
 
@@ -404,7 +404,7 @@ def _build_middlewares(config, model_name, agent_name, custom_middlewares):
     return middlewares
 ```
 
-> **Gemini Prompt:** 用洋葱模型图展示 DeerFlow 的 14 层 Agent 中间件链。IdentityMiddleware 在最内层，ClarificationMiddleware 在最外层。每层标注名称和核心职责。用箭头标注请求从外到内、响应从内到外的方向。用颜色分组：身份层（蓝）、数据层（绿）、安全层（红）、上下文层（黄）、功能层（紫）。
+![alt text](Gemini_Generated_Image_st7a2lst7a2lst7a.png)
 
 ---
 
@@ -677,7 +677,7 @@ def ensure_sqlite_parent_dir(conn_str: str) -> None:
     pathlib.Path(conn_str).parent.mkdir(parents=True, exist_ok=True)
 ```
 
-> **Gemini Prompt:** 用对比图展示 Checkpointer 和 Store 的关系。左侧是 Checkpointer（存储 ThreadState：messages, sandbox, thread_data），右侧是 Store（存储 Thread 列表、用户数据）。底部共享同一个 checkpointer: 配置节。标注三后端（memory/sqlite/postgres）的适用场景。
+![alt text](Gemini_Generated_Image_s6z4k2s6z4k2s6z4.png)
 
 ---
 
@@ -1196,9 +1196,9 @@ skills/
 | 登录锁 | IP+email 复合 key, 5min 10 次触发 15min 锁定 |
 | OIDC 多 provider | config/identity.yaml 配置, state+PKCE 存 Redis 5min |
 
-> **Gemini Prompt:** 用三层同心圆图展示 RBAC 模型。外圈 platform scope（platform_admin），中圈 tenant scope（tenant_owner），内圈 workspace scope（workspace_admin/member/viewer）。每个角色标注核心权限点。platform_admin 箭头标注绕过所有检查。
+![alt text](Gemini_Generated_Image_87sonw87sonw87so.png)
 
-> **Gemini Prompt:** 用序列图展示 OIDC 登录流程。泳道: Browser, Frontend, Gateway, Redis, IdP, PG。步骤: 未登录 → 跳转 IdP → 输入凭证 → 回调 → 交换 code → 验签 → upsert → 签发 JWT → 写 Redis → Set-Cookie → 重定向。
+![alt text](Gemini_Generated_Image_a3h1r0a3h1r0a3h1.png)
 
 ---
 
@@ -1266,7 +1266,7 @@ HTTP 写操作 (POST/PUT/PATCH/DELETE) 进入关键路径
 3. **脱敏在入队前完成**
 4. **租户隔离同业务表**
 
-> **Gemini Prompt:** 用流程图展示审计管线：HTTP Request → AuditMiddleware → asyncio.Queue → AuditBatchWriter (每 1s / 500 条) → Postgres executemany。标注故障分支：Queue Full + Critical → 同步写；PG 挂 → Fallback JSONL；恢复 → Backfill。标注脱敏点在入队前。
+![alt text](Gemini_Generated_Image_8xl8by8xl8by8xl8.png)
 
 ---
 
@@ -1544,7 +1544,7 @@ Nginx (负载均衡)
 | 3 | Subagent → 独立进程 | 高（架构变更） | 弹性伸缩 |
 | 4 | Gateway 水平扩展 | 低（已 PG+Redis） | 高可用 |
 
-> **Gemini Prompt:** 用部署架构图展示理想生产方案。Nginx → Frontend 多副本 → Gateway 单实例（嵌入 Agent Runtime）→ 共享 PostgreSQL（identity + checkpointer + store）→ 共享 Redis。虚线标注未来组件（Redis StreamBridge、独立 Subagent 进程池）。标注有状态/无状态。
+![alt text](Gemini_Generated_Image_mn625rmn625rmn62.png)
 
 ---
 
@@ -2308,7 +2308,7 @@ def resolve_class(path: str, base_type: type | None = None) -> type:
 
 **SQLite 的真正瓶颈不是容量，而是并发写入**——单文件锁意味着同一时刻只能一个进程写入。如果只有一个 Gateway 实例，SQLite 完全足够。如果多个 Gateway 实例或预期并发高，才需要升级到 Postgres。
 
-> **Gemini Prompt:** 用对比表+示意图展示三种 Checkpointer 后端（memory/sqlite/postgres）的数据流。memory→进程内存（重启丢失），sqlite→.db 磁盘文件（单进程），postgres→数据库服务器（多进程）。标注 SQLite 的 page cache 可被 OS 回收，说明物理内存不会被 checkpoint 数据耗尽。
+![alt text](Gemini_Generated_Image_smhjbdsmhjbdsmhj.png)
 
 ---
 
@@ -2576,4 +2576,4 @@ def check_thread_quota(thread_id, max_mb=500):
 如果后续还觉得空间不够，再根据你公司的数据库生态选 **P1（MySQL）** 或 **P1-alternative（Postgres）**。  
 只要 P0 做了，P1/P2/P3/P4 可以从容安排——P0 本身已经解决了最大的问题（双重存储）。
 
-> **Gemini Prompt:** 用数据流图展示图片从上传到 checkpoint 的完整路径。标注三个关键点：1) view_image_tool 将图片转为 base64（33% 膨胀），2) viewed_images 字典存储 base64，3) ViewImageMiddleware 将 base64 再次注入到 messages 中。用红色突出"双重存储"问题。旁边用对比图展示解决方案 A（注入后清空）的效果。
+![alt text](Gemini_Generated_Image_kniwk6kniwk6kniw.png)
