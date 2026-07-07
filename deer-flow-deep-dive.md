@@ -135,7 +135,7 @@ backend/packages/harness/deerflow/
 └── utils/                            ← 工具函数
 ```
 
-![alt text](Gemini_Generated_Image_pbe8gvpbe8gvpbe8.png)
+![alt text](package-structure.png)
 
 ---
 
@@ -183,7 +183,7 @@ Agent 运行时**嵌入 Gateway 进程**，无独立 LangGraph Server。`/api/la
 | Gateway 进程负载 | 轻 | 重（嵌入 agent 执行） |
 | 适用场景 | 开发/小规模 | 生产/私有化部署 |
 
-> **个人评价**：Gateway 模式更适合生产部署——少一个进程、减少网络跳转、简化运维。代价是 Gateway 进程的 CPU/内存消耗更高。建议 Gateway 模式 + Postgres checkpointer + 单实例部署。
+综合来看，Gateway 模式更适合生产部署——少一个进程、减少网络跳转、简化运维。代价是 Gateway 进程的 CPU/内存消耗更高。实际部署建议使用 Gateway 模式 + Postgres checkpointer + 单实例部署。
 
 ---
 
@@ -404,7 +404,7 @@ def _build_middlewares(config, model_name, agent_name, custom_middlewares):
     return middlewares
 ```
 
-![alt text](Gemini_Generated_Image_st7a2lst7a2lst7a.png)
+![alt text](middleware-chain.png)
 
 ---
 
@@ -677,7 +677,7 @@ def ensure_sqlite_parent_dir(conn_str: str) -> None:
     pathlib.Path(conn_str).parent.mkdir(parents=True, exist_ok=True)
 ```
 
-![alt text](Gemini_Generated_Image_s6z4k2s6z4k2s6z4.png)
+![alt text](architecture-checkpointer-flow.png)
 
 ---
 
@@ -1196,9 +1196,9 @@ skills/
 | 登录锁 | IP+email 复合 key, 5min 10 次触发 15min 锁定 |
 | OIDC 多 provider | config/identity.yaml 配置, state+PKCE 存 Redis 5min |
 
-![alt text](Gemini_Generated_Image_87sonw87sonw87so.png)
+![alt text](architecture-tool-loading.png)
 
-![alt text](Gemini_Generated_Image_a3h1r0a3h1r0a3h1.png)
+![alt text](architecture-m5-identity.png)
 
 ---
 
@@ -1266,7 +1266,7 @@ HTTP 写操作 (POST/PUT/PATCH/DELETE) 进入关键路径
 3. **脱敏在入队前完成**
 4. **租户隔离同业务表**
 
-![alt text](Gemini_Generated_Image_8xl8by8xl8by8xl8.png)
+![alt text](architecture-serialization.png)
 
 ---
 
@@ -1544,7 +1544,7 @@ Nginx (负载均衡)
 | 3 | Subagent → 独立进程 | 高（架构变更） | 弹性伸缩 |
 | 4 | Gateway 水平扩展 | 低（已 PG+Redis） | 高可用 |
 
-![alt text](Gemini_Generated_Image_mn625rmn625rmn62.png)
+![alt text](architecture-subagent-memory.png)
 
 ---
 
@@ -2308,7 +2308,7 @@ def resolve_class(path: str, base_type: type | None = None) -> type:
 
 **SQLite 的真正瓶颈不是容量，而是并发写入**——单文件锁意味着同一时刻只能一个进程写入。如果只有一个 Gateway 实例，SQLite 完全足够。如果多个 Gateway 实例或预期并发高，才需要升级到 Postgres。
 
-![alt text](Gemini_Generated_Image_smhjbdsmhjbdsmhj.png)
+![alt text](checkpoint-storage.png)
 
 ---
 
@@ -2403,8 +2403,6 @@ def _make_agent_node(model, tools, middleware, system_prompt, name):
 ```
 
 ---
-
-*本文档由 Codex 基于 deer-flow-by-cc 仓库源码和设计文档自动生成。综合覆盖 Harness 引擎、LangGraph 执行模型内部机制、身份/多租户/审计、Checkpoint 持久化、部署方案四大模块。2026-07-05。*
 
 ---
 
@@ -2575,4 +2573,4 @@ def check_thread_quota(thread_id, max_mb=500):
 如果后续还觉得空间不够，再根据公司的数据库生态选 **P1（MySQL）** 或 **P1-alternative（Postgres）**。  
 只要 P0 做了，P1/P2/P3/P4 可以从容安排——P0 本身已经解决了最大的问题（双重存储）。
 
-![alt text](Gemini_Generated_Image_kniwk6kniwk6kniw.png)
+![alt text](disk-space-solutions.png)
